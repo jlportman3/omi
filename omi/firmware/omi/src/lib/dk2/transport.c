@@ -318,6 +318,15 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
         current_connection = NULL;
     }
     current_mtu = 0;
+
+    int adv_err = bt_le_adv_start(BT_LE_ADV_CONN,
+                                  bt_ad,
+                                  ARRAY_SIZE(bt_ad),
+                                  bt_sd,
+                                  ARRAY_SIZE(bt_sd));
+    if (adv_err) {
+        LOG_ERR("Transport advertising failed to start (err %d)", adv_err);
+    }
 }
 
 static bool _le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
