@@ -185,6 +185,10 @@ class DeviceService implements IDeviceService {
     for (var s in _subscriptions.values) {
       s.onDeviceConnectionStateChanged(deviceId, state);
     }
+
+    if (state == DeviceConnectionState.disconnected) {
+      discover(desirableDeviceId: deviceId);
+    }
   }
 
   void onDevices(List<BtDevice> devices) {
