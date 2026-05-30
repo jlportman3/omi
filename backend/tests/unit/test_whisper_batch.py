@@ -23,6 +23,7 @@ import types
 import wave
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 os.environ.setdefault(
@@ -250,6 +251,43 @@ class TestLocalWhisperPrerecordedFromBytes:
 # ---------------------------------------------------------------------------
 
 
+class TestLocalWhisperPrerecordedFromUrl:
+    @patch("utils.stt.pre_recorded.httpx.get")
+    @patch("utils.stt.pre_recorded.local_whisper_prerecorded_from_bytes")
+    def test_fetches_url_and_delegates(self, mock_bytes, mock_get, pre_recorded):
+        fetched = MagicMock(status_code=200, content=b"\x00" * 1000)
+        fetched.raise_for_status = MagicMock()
+        mock_get.return_value = fetched
+        mock_bytes.return_value = [{"timestamp": [0, 1], "speaker": "SPEAKER_00", "text": "ok"}]
+
+        out = pre_recorded.local_whisper_prerecorded("https://example.com/audio.wav", diarize=True, language="en")
+        assert mock_get.call_count == 1
+        # downloaded bytes must be forwarded to the bytes helper
+        assert mock_bytes.call_count == 1
+        forwarded = mock_bytes.call_args.args[0]
+        assert forwarded == b"\x00" * 1000
+        assert out == [{"timestamp": [0, 1], "speaker": "SPEAKER_00", "text": "ok"}]
+
+    @patch("utils.stt.pre_recorded.httpx.get")
+    @patch("utils.stt.pre_recorded.local_whisper_prerecorded_from_bytes")
+    def test_return_language_propagates_tuple(self, mock_bytes, mock_get, pre_recorded):
+        fetched = MagicMock(status_code=200, content=b"\x00" * 1000)
+        fetched.raise_for_status = MagicMock()
+        mock_get.return_value = fetched
+        mock_bytes.return_value = ([], "es")
+
+        result = pre_recorded.local_whisper_prerecorded("https://example.com/audio.wav", return_language=True)
+        assert result == ([], "es")
+
+    @patch("utils.stt.pre_recorded.httpx.get")
+    def test_fetch_failure_raises_after_retry(self, mock_get, pre_recorded):
+        mock_get.side_effect = httpx.RequestError("boom")
+        # Function should retry once (attempts<1) then raise — patched httpx.get is hit twice.
+        with pytest.raises(RuntimeError, match="Audio fetch failed"):
+            pre_recorded.local_whisper_prerecorded("https://example.com/audio.wav")
+        assert mock_get.call_count == 2
+
+
 class TestPublicFunctionRouting:
     def test_whisper_backend_delegates_to_local(self, pre_recorded, monkeypatch):
         monkeypatch.setattr(pre_recorded, "STT_BATCH_BACKEND", "whisper")
@@ -264,6 +302,22 @@ class TestPublicFunctionRouting:
         monkeypatch.setattr(pre_recorded, "local_whisper_prerecorded_from_bytes", _fake_local)
         out = pre_recorded.deepgram_prerecorded_from_bytes(b"\x00" * 8, diarize=True, language="en")
         assert called.get("yes")
+        assert out == [{"timestamp": [0, 1], "speaker": "SPEAKER_00", "text": "ok"}]
+
+    def test_whisper_backend_routes_url_function(self, pre_recorded, monkeypatch):
+        """Public deepgram_prerecorded (URL variant) must delegate to local_whisper_prerecorded."""
+        monkeypatch.setattr(pre_recorded, "STT_BATCH_BACKEND", "whisper")
+        called = {"yes": False}
+
+        def _fake_url(url, **kwargs):
+            called["yes"] = True
+            called["url"] = url
+            return [{"timestamp": [0, 1], "speaker": "SPEAKER_00", "text": "ok"}]
+
+        monkeypatch.setattr(pre_recorded, "local_whisper_prerecorded", _fake_url)
+        out = pre_recorded.deepgram_prerecorded("https://example.com/audio.wav", diarize=True)
+        assert called["yes"]
+        assert called["url"] == "https://example.com/audio.wav"
         assert out == [{"timestamp": [0, 1], "speaker": "SPEAKER_00", "text": "ok"}]
 
     def test_deepgram_backend_unchanged(self, pre_recorded, monkeypatch):
