@@ -151,7 +151,18 @@ from utils.stt.pre_recorded import deepgram_prerecorded_from_bytes
 
 
 class TestDeepgramPrerecordedFromBytesPCM:
-    """Verify raw PCM options are forwarded correctly to Deepgram."""
+    """Verify raw PCM options are forwarded correctly to Deepgram.
+
+    These tests exercise the *legacy* Deepgram batch path. Since the default
+    backend has shifted to local Whisper, each test must opt back into the
+    Deepgram codepath via the autouse fixture below.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _use_deepgram_backend(self, monkeypatch):
+        from utils.stt import pre_recorded
+
+        monkeypatch.setattr(pre_recorded, "STT_BATCH_BACKEND", "deepgram")
 
     @patch('utils.stt.pre_recorded._deepgram_client')
     def test_pcm_encoding_passed_to_options(self, mock_client):

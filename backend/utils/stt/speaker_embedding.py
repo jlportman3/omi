@@ -23,6 +23,16 @@ SPEAKER_MATCH_THRESHOLD = 0.45
 # Audio shorter than this crashes pyannote wespeaker fbank (see issue #4572).
 MIN_EMBEDDING_AUDIO_DURATION = float(os.getenv("MIN_EMBEDDING_AUDIO_DURATION", "0.5"))
 
+# Endpoint path on HOSTED_SPEAKER_EMBEDDING_API_URL. Defaults to the rtx6000
+# voice-extras OpenAI-shape endpoint; override to "/v2/embedding" to point at
+# the legacy GPUFARM omi-diarizer (wespeaker) container.
+SPEAKER_EMBEDDING_PATH = os.getenv("SPEAKER_EMBEDDING_PATH", "/v1/embeddings")
+
+# Model alias the embedding service should use. Sent as a multipart form
+# field on every request. Required by voice-extras; harmlessly ignored by
+# legacy diarizer. Set to empty string to omit the field entirely.
+SPEAKER_EMBEDDING_MODEL = os.getenv("SPEAKER_EMBEDDING_MODEL", "titanet-large")
+
 
 def _get_wav_duration(audio_data: bytes) -> float:
     """Get duration in seconds from WAV bytes. Returns 0.0 on parse failure."""
@@ -44,6 +54,44 @@ def _get_api_url() -> str:
     return url
 
 
+def _embedding_endpoint() -> str:
+    """Build the full POST URL by joining the base + configured path."""
+    return f"{_get_api_url().rstrip('/')}{SPEAKER_EMBEDDING_PATH}"
+
+
+def _model_form_field() -> Optional[dict]:
+    """Multipart `data=` kwarg for httpx, or None when model is unset."""
+    return {"model": SPEAKER_EMBEDDING_MODEL} if SPEAKER_EMBEDDING_MODEL else None
+
+
+def _parse_embedding_response(payload) -> np.ndarray:
+    """Normalise three known response shapes to a (1, D) float32 array.
+
+    - bare list                                 → legacy diarizer (rare)
+    - {"embedding": [...]}                      → legacy wespeaker / pyannote
+    - {"data": [{"embedding": [...]}], ...}     → voice-extras (OpenAI shape)
+    """
+    if isinstance(payload, list):
+        vector = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("embedding"), list):
+        vector = payload["embedding"]
+    elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        data = payload["data"]
+        if not data:
+            raise ValueError("Embedding response has empty 'data' array")
+        first = data[0]
+        if not isinstance(first, dict) or not isinstance(first.get("embedding"), list):
+            raise ValueError("Embedding response 'data[0].embedding' missing or wrong type")
+        vector = first["embedding"]
+    else:
+        raise ValueError(f"unrecognised embedding response shape: {type(payload).__name__}")
+
+    arr = np.array(vector, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    return arr
+
+
 def extract_embedding(audio_path: str) -> np.ndarray:
     """
     Extract speaker embedding from an audio file using hosted API.
@@ -54,26 +102,12 @@ def extract_embedding(audio_path: str) -> np.ndarray:
     Returns:
         numpy array of shape (1, D) where D is embedding dimension
     """
-    api_url = _get_api_url()
-
     with open(audio_path, 'rb') as f:
         files = {'file': (os.path.basename(audio_path), f, 'audio/wav')}
-        response = httpx.post(f"{api_url}/v2/embedding", files=files, timeout=300.0)
+        response = httpx.post(_embedding_endpoint(), files=files, data=_model_form_field(), timeout=300.0)
         response.raise_for_status()
 
-    result = response.json()
-
-    # Handle both formats: direct array or {"embedding": [...]}
-    if isinstance(result, list):
-        embedding = np.array(result, dtype=np.float32)
-    else:
-        embedding = np.array(result['embedding'], dtype=np.float32)
-
-    # Ensure shape is (1, D)
-    if embedding.ndim == 1:
-        embedding = embedding.reshape(1, -1)
-
-    return embedding
+    return _parse_embedding_response(response.json())
 
 
 def extract_embedding_from_bytes(audio_data: bytes, filename: str = "audio.wav") -> np.ndarray:
@@ -94,25 +128,11 @@ def extract_embedding_from_bytes(audio_data: bytes, filename: str = "audio.wav")
     if duration < MIN_EMBEDDING_AUDIO_DURATION:
         raise ValueError(f"Audio too short for speaker embedding: {duration:.3f}s < {MIN_EMBEDDING_AUDIO_DURATION}s")
 
-    api_url = _get_api_url()
-
     files = {'file': (filename, audio_data, 'audio/wav')}
-    response = httpx.post(f"{api_url}/v2/embedding", files=files, timeout=300.0)
+    response = httpx.post(_embedding_endpoint(), files=files, data=_model_form_field(), timeout=300.0)
     response.raise_for_status()
 
-    result = response.json()
-
-    # Handle both formats: direct array or {"embedding": [...]}
-    if isinstance(result, list):
-        embedding = np.array(result, dtype=np.float32)
-    else:
-        embedding = np.array(result['embedding'], dtype=np.float32)
-
-    # Ensure shape is (1, D)
-    if embedding.ndim == 1:
-        embedding = embedding.reshape(1, -1)
-
-    return embedding
+    return _parse_embedding_response(response.json())
 
 
 def _read_file(path: str) -> bytes:
@@ -122,7 +142,6 @@ def _read_file(path: str) -> bytes:
 
 async def async_extract_embedding(audio_path: str) -> np.ndarray:
     """Async version of extract_embedding using httpx.AsyncClient."""
-    api_url = _get_api_url()
     client = get_stt_client()
 
     loop = asyncio.get_running_loop()
@@ -130,21 +149,13 @@ async def async_extract_embedding(audio_path: str) -> np.ndarray:
 
     files = {'file': (os.path.basename(audio_path), file_data, 'audio/wav')}
     try:
-        response = await client.post(f"{api_url}/v2/embedding", files=files)
+        response = await client.post(_embedding_endpoint(), files=files, data=_model_form_field())
         response.raise_for_status()
     except Exception as e:
         logger.error(f"async_extract_embedding failed for {audio_path}: {e}")
         raise
 
-    result = response.json()
-    if isinstance(result, list):
-        embedding = np.array(result, dtype=np.float32)
-    else:
-        embedding = np.array(result['embedding'], dtype=np.float32)
-
-    if embedding.ndim == 1:
-        embedding = embedding.reshape(1, -1)
-    return embedding
+    return _parse_embedding_response(response.json())
 
 
 async def async_extract_embedding_from_bytes(audio_data: bytes, filename: str = "audio.wav") -> np.ndarray:
@@ -153,26 +164,17 @@ async def async_extract_embedding_from_bytes(audio_data: bytes, filename: str = 
     if duration < MIN_EMBEDDING_AUDIO_DURATION:
         raise ValueError(f"Audio too short for speaker embedding: {duration:.3f}s < {MIN_EMBEDDING_AUDIO_DURATION}s")
 
-    api_url = _get_api_url()
     client = get_stt_client()
 
     files = {'file': (filename, audio_data, 'audio/wav')}
     try:
-        response = await client.post(f"{api_url}/v2/embedding", files=files)
+        response = await client.post(_embedding_endpoint(), files=files, data=_model_form_field())
         response.raise_for_status()
     except Exception as e:
         logger.error(f"async_extract_embedding_from_bytes failed: {e}")
         raise
 
-    result = response.json()
-    if isinstance(result, list):
-        embedding = np.array(result, dtype=np.float32)
-    else:
-        embedding = np.array(result['embedding'], dtype=np.float32)
-
-    if embedding.ndim == 1:
-        embedding = embedding.reshape(1, -1)
-    return embedding
+    return _parse_embedding_response(response.json())
 
 
 def compare_embeddings(embedding1: np.ndarray, embedding2: np.ndarray) -> float:

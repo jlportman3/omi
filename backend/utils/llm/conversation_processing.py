@@ -119,7 +119,9 @@ Provide:
 {format_instructions}'''
 
     folder_parser = PydanticOutputParser(pydantic_object=FolderAssignment)
-    prompt = ChatPromptTemplate.from_messages([('system', prompt_text)])
+    # LiteLLM/Mistral 400s on system-only prompts ("No user query found in messages");
+    # render as a single user message so the request is always accepted.
+    prompt = ChatPromptTemplate.from_messages([('user', prompt_text)])
     chain = prompt | get_llm('conv_folder') | folder_parser
 
     try:
@@ -531,9 +533,10 @@ def extract_action_items(
 
     response_language = output_language_code or language_code
     action_items_parser = PydanticOutputParser(pydantic_object=ActionItemsExtraction)
-    # Second system message: conversation context + existing items (dynamic, per-conversation)
+    # The context message becomes the user turn so LiteLLM/Mistral sees at least
+    # one non-system message ("No user query found in messages" otherwise 400s).
     context_message = 'The content language is {language_code}. You MUST respond entirely in {response_language}.\n\nContent:\n{conversation_context}{existing_items_context}'
-    prompt = ChatPromptTemplate.from_messages([('system', instructions_text), ('system', context_message)])
+    prompt = ChatPromptTemplate.from_messages([('system', instructions_text), ('user', context_message)])
     chain = prompt | get_llm('conv_action_items', cache_key='omi-extract-actions') | action_items_parser
 
     current_time = datetime.now(timezone.utc)
@@ -644,7 +647,9 @@ def get_transcript_structure(
 
     # Second system message: conversation context (dynamic, per-conversation)
     context_message = 'The content language is {language_code}. You MUST respond entirely in {response_language}.\n\nContent:\n{conversation_context}'
-    prompt = ChatPromptTemplate.from_messages([('system', instructions_text), ('system', context_message)])
+    # LiteLLM proxies reject prompts with no user/human message ("No user query found in messages").
+    # The conversation content is what we're effectively asking the model about, so send it as user.
+    prompt = ChatPromptTemplate.from_messages([('system', instructions_text), ('user', context_message)])
     chain = prompt | get_llm('conv_structure', cache_key='omi-transcript-structure') | parser
 
     response = chain.invoke(
@@ -728,7 +733,8 @@ def get_reprocess_transcript_structure(
         '    ', ''
     ).strip()
 
-    prompt = ChatPromptTemplate.from_messages([('system', prompt_text)])
+    # LiteLLM proxies reject prompts with no user/human message ("No user query found in messages").
+    prompt = ChatPromptTemplate.from_messages([('user', prompt_text)])
     chain = prompt | get_llm('conv_structure', cache_key='omi-transcript-structure') | parser
 
     response = chain.invoke(
