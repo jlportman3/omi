@@ -1,4 +1,6 @@
+import io
 import os
+import wave
 from collections import defaultdict
 from io import BytesIO
 from typing import List, Optional, Sequence, Tuple, Union
@@ -20,6 +22,16 @@ logger = logging.getLogger(__name__)
 # WARN: the pre-recorded transcription is available on deepgram cloud
 _deepgram_options = DeepgramClientOptions(options={"keepalive": "true"})
 _deepgram_client = DeepgramClient(os.getenv('DEEPGRAM_API_KEY'), _deepgram_options)
+
+# Which batch STT backend to use. "whisper" (default) routes through the local
+# LiteLLM proxy to faster-whisper-large-v3 on rtx6000, with optional Sortformer
+# diarization via voice-extras. "deepgram" preserves the legacy cloud path for
+# rollback (set STT_BATCH_BACKEND=deepgram + DEEPGRAM_API_KEY).
+STT_BATCH_BACKEND = os.getenv("STT_BATCH_BACKEND", "whisper").lower()
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-large-v3")
+WHISPER_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://10.0.60.48:4000/v1").rstrip("/")
+VOICE_EXTRAS_URL = os.getenv("VOICE_EXTRAS_URL", "http://10.0.60.48:8094").rstrip("/")
+SORTFORMER_MODEL = os.getenv("SORTFORMER_MODEL", "sortformer-stream")
 
 
 def _deepgram_client_for_request() -> DeepgramClient:
@@ -140,6 +152,155 @@ def get_deepgram_model_for_language(language: str) -> Tuple[str, str]:
 
     # Unsupported language - fall back to multi for auto-detection
     return 'multi', 'nova-3'
+
+
+def _wav_wrap_pcm(pcm_bytes: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
+    """Wrap raw 16-bit signed PCM in a WAV header.
+
+    The local Whisper endpoint expects a decodable audio file. Callers that
+    pass raw PCM (encoding='linear16') must have their bytes wrapped before
+    upload; this helper produces a minimal RIFF/WAVE container in memory.
+    """
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+def _merge_words_with_speakers(whisper_words: List[dict], diarization_segments: List[dict]) -> List[dict]:
+    """Merge per-word Whisper timestamps with Sortformer speaker segments.
+
+    Returns the legacy Deepgram-compatible word-dict shape:
+        {'timestamp': [start, end], 'speaker': 'SPEAKER_XX', 'text': 'word'}
+
+    Each Whisper word is assigned a speaker by looking up the diarization
+    segment whose time-range contains the word's midpoint. Words that fall
+    outside any segment (gaps in Sortformer coverage) default to SPEAKER_00.
+    When no diarization segments are present at all, every word is SPEAKER_00.
+    """
+    out: List[dict] = []
+    for w in whisper_words:
+        start = float(w.get("start", 0.0))
+        end = float(w.get("end", 0.0))
+        midpoint = (start + end) / 2
+        speaker = "SPEAKER_00"
+        for s in diarization_segments:
+            try:
+                if s["start"] <= midpoint <= s["end"]:
+                    idx = int(str(s.get("speaker", "speaker_0")).split("_")[-1])
+                    speaker = f"SPEAKER_{idx:02d}"
+                    break
+            except (KeyError, ValueError, TypeError):
+                continue
+        text = (w.get("word") or "").strip()
+        out.append({"timestamp": [start, end], "speaker": speaker, "text": text})
+    return out
+
+
+def _post_whisper(audio_bytes: bytes, language: Optional[str], model: Optional[str]) -> dict:
+    """POST audio to LiteLLM /v1/audio/transcriptions and return the parsed JSON."""
+    files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
+    data = {
+        "model": model or WHISPER_MODEL,
+        "response_format": "verbose_json",
+        "timestamp_granularities[]": "word",
+    }
+    if language and language != "multi":
+        data["language"] = language
+    headers = {}
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    resp = httpx.post(
+        f"{WHISPER_BASE_URL}/audio/transcriptions",
+        files=files,
+        data=data,
+        headers=headers,
+        timeout=_DG_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _post_sortformer(audio_bytes: bytes) -> List[dict]:
+    """POST audio to voice-extras /v1/audio/diarization and return the segments list.
+
+    Falls back to an empty list if Sortformer fails — the caller will then
+    default every word to SPEAKER_00, which is better than failing the whole
+    transcription over a diarization hiccup.
+    """
+    try:
+        files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
+        data = {"model": SORTFORMER_MODEL}
+        resp = httpx.post(
+            f"{VOICE_EXTRAS_URL}/v1/audio/diarization",
+            files=files,
+            data=data,
+            timeout=_DG_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json().get("segments") or []
+    except Exception as e:
+        logger.warning(f"Sortformer diarization failed, falling back to single-speaker: {e}")
+        return []
+
+
+@timeit
+def local_whisper_prerecorded_from_bytes(
+    audio_bytes: bytes,
+    sample_rate: int = 16000,
+    diarize: bool = True,
+    attempts: int = 0,
+    encoding: Optional[str] = None,
+    channels: int = 1,
+    language: Optional[str] = None,
+    model: Optional[str] = None,
+    return_language: bool = False,
+    keywords: Optional[Sequence[str]] = None,
+) -> Union[List[dict], Tuple[List[dict], str]]:
+    """Local Whisper (+optional Sortformer) replacement for deepgram_prerecorded_from_bytes.
+
+    Produces the same legacy word-dict shape so callers do not need to change.
+    Raw PCM (encoding='linear16') is wrapped in a WAV header before upload.
+
+    Args:
+        audio_bytes: WAV file bytes or raw PCM (set encoding='linear16').
+        sample_rate: Sample rate of the source. Required for raw PCM.
+        diarize: When True, call Sortformer and assign per-word speakers.
+        attempts: Retry counter (currently single-attempt; reserved for parity).
+        encoding: 'linear16' for raw PCM, None for WAV.
+        channels: Mono / stereo channel count of the source PCM.
+        language: ISO code or 'multi' for auto-detect.
+        model: Override WHISPER_MODEL alias if needed.
+        return_language: When True, returns (words, detected_language).
+        keywords: Accepted but unused — Whisper does not support keyterm boost.
+    """
+    logger.info(
+        f"local_whisper_prerecorded_from_bytes bytes_len={len(audio_bytes)} "
+        f"encoding={encoding} sample_rate={sample_rate} diarize={diarize} language={language}"
+    )
+
+    if encoding == "linear16":
+        audio_bytes = _wav_wrap_pcm(audio_bytes, sample_rate=sample_rate, channels=channels)
+
+    payload = _post_whisper(audio_bytes, language=language, model=model)
+    words = payload.get("words") or []
+    detected_lang = (payload.get("language") or "en").split("-")[0]
+
+    if not words:
+        if return_language:
+            return [], detected_lang or "en"
+        return []
+
+    diarization_segments = _post_sortformer(audio_bytes) if diarize else []
+    out_words = _merge_words_with_speakers(words, diarization_segments)
+
+    if return_language:
+        return out_words, detected_lang or "en"
+    return out_words
 
 
 @timeit
@@ -297,6 +458,20 @@ def deepgram_prerecorded_from_bytes(
     logger.info(
         f'deepgram_prerecorded_from_bytes bytes_len={len(audio_bytes)} {sample_rate} {diarize} {attempts} encoding={encoding} language={language} model={model}'
     )
+
+    if STT_BATCH_BACKEND == "whisper":
+        return local_whisper_prerecorded_from_bytes(
+            audio_bytes,
+            sample_rate=sample_rate,
+            diarize=diarize,
+            attempts=attempts,
+            encoding=encoding,
+            channels=channels,
+            language=language,
+            model=None,  # use WHISPER_MODEL default; callers pass nova-3 which is Deepgram-specific
+            return_language=return_language,
+            keywords=keywords,
+        )
 
     try:
         is_multi = language == 'multi'
