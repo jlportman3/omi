@@ -120,8 +120,10 @@ def test_reject_voice_id_path_traversal():
 
 
 def test_reject_voice_id_special_chars():
+    # Special-char rejection that applies to BOTH backends. Underscore is
+    # backend-dependent (kokoro accepts it, elevenlabs rejects it) and is
+    # covered in test_tts_kokoro.py instead.
     assert not tts_router._is_valid_voice_id("id-with-dash")
-    assert not tts_router._is_valid_voice_id("id_with_underscore")
     assert not tts_router._is_valid_voice_id("id with space")
     assert not tts_router._is_valid_voice_id("id?query=1")
 
