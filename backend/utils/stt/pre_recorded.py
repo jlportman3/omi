@@ -249,6 +249,49 @@ def _post_sortformer(audio_bytes: bytes) -> List[dict]:
 
 
 @timeit
+def local_whisper_prerecorded(
+    audio_url: str,
+    speakers_count: int = None,
+    attempts: int = 0,
+    return_language: bool = False,
+    diarize: bool = True,
+    language: Optional[str] = None,
+    model: Optional[str] = None,
+    keywords: Optional[Sequence[str]] = None,
+) -> Union[List[dict], Tuple[List[dict], str]]:
+    """URL-variant of local_whisper_prerecorded_from_bytes.
+
+    Whisper's API takes uploaded bytes — there is no remote-fetch equivalent of
+    Deepgram's transcribe_url — so we fetch the URL here and delegate to the
+    bytes helper. Signature mirrors deepgram_prerecorded() so callers do not
+    need to branch.
+    """
+    logger.info(f"local_whisper_prerecorded {audio_url} {speakers_count} {attempts}")
+
+    try:
+        resp = httpx.get(audio_url, timeout=_DG_TIMEOUT, follow_redirects=True)
+        resp.raise_for_status()
+        audio_bytes = resp.content
+    except Exception as e:
+        logger.warning(f"Audio fetch failed (attempt {attempts}): {e}")
+        if attempts < 1:
+            return local_whisper_prerecorded(
+                audio_url, speakers_count, attempts + 1, return_language, diarize, language, model, keywords
+            )
+        raise RuntimeError(f"Audio fetch failed after {attempts + 1} attempts: {e}")
+
+    return local_whisper_prerecorded_from_bytes(
+        audio_bytes,
+        diarize=diarize,
+        attempts=attempts,
+        language=language,
+        model=None,
+        return_language=return_language,
+        keywords=keywords,
+    )
+
+
+@timeit
 def local_whisper_prerecorded_from_bytes(
     audio_bytes: bytes,
     sample_rate: int = 16000,
@@ -332,6 +375,18 @@ def deepgram_prerecorded(
         Or tuple of (words, language) if return_language=True
     """
     logger.info(f'deepgram_prerecorded {audio_url} {speakers_count} {attempts}')
+
+    if STT_BATCH_BACKEND == "whisper":
+        return local_whisper_prerecorded(
+            audio_url,
+            speakers_count=speakers_count,
+            attempts=attempts,
+            return_language=return_language,
+            diarize=diarize,
+            language=language,
+            model=None,  # nova-3 is Deepgram-specific; let WHISPER_MODEL default apply
+            keywords=keywords,
+        )
 
     try:
         # 'multi' language means auto-detection
