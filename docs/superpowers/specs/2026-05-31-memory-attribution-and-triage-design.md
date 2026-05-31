@@ -373,10 +373,14 @@ def attribute_user(transcript_segments, bank, audio_pcm, sample_rate=16000):
         elif seg._cluster_decision == 'user':
             final  = True
             reason = 'cluster_split_lower_mode' if seg._cluster_split else 'cluster_vote_user'
-        # 4. Borderline rescue: cluster said 'other' but FP-adjusted distance crosses T_STRICT
+        # 4. Borderline rescue: cluster said 'other' but the RAW distance is already
+        #    below T_STRICT and FP language confirms a near-pass. The FP prior is a
+        #    *confirmation* signal — it must not turn raw-above-T_STRICT into a pass
+        #    via fp_adjust alone (see "Validation findings v1.1" below).
         elif (seg._adj_dist is not None
-              and seg._adj_dist < T_STRICT
-              and FP_BORDERLINE_BAND[0] <= (seg._raw_dist or 1.0) <= FP_BORDERLINE_BAND[1]
+              and seg._raw_dist is not None
+              and seg._raw_dist < T_STRICT
+              and FP_BORDERLINE_BAND[0] <= seg._raw_dist <= FP_BORDERLINE_BAND[1]
               and seg._fp_present):
             final, reason = True, 'fp_prior_rescue'
         else:
@@ -497,6 +501,20 @@ Per conversation (10-min average, ~120 segments at ~4s mean duration):
 | Jarvis-TTS treated as non-user (cloned voice paradox) | Strong-solo override accepts at distance < 0.30 |
 | Bimodal Joe distances (0.27 vs 0.65-0.74) on wearable audio | Cluster cohesion: distant-mode Joe segments rescued by sharing a `speaker_id` cluster with strong-match Joe sub-windows |
 | Unaccountable attribution | Every segment carries `attribution.{distance_raw, decision_reason, cluster_decision, voiceprint_version, algo_version}` — Layer 5 critic + Layer 6 re-diarize can replay and audit any decision |
+
+### Validation findings v1.1 (bug fix)
+
+End-to-end batch validation on 2026-05-31 (workflow `we70h49t5`) on the phantom-memory test conversation `f5668903-33da-42d9-a9c8-b77d3a9e4a3f` (heist movie audio) surfaced a high-severity false positive in Stage 4's `fp_prior_rescue` branch:
+
+- Two segments at `raw_dist=0.595` in `cluster_other` clusters, containing first-person tokens in heist-movie dialogue, were falsely rescued to `is_user=True`.
+- Root cause: the elif condition checked `adj_dist < T_STRICT` after applying `fp_adjust=-0.05`. A raw distance above `T_STRICT` (0.595 > 0.5473) became an adjusted distance below `T_STRICT` (0.545 < 0.5473) and slipped through.
+- The original design intent of `fp_prior` was a **confirmation** signal (raw was already near-passing; `fp_present` widens the band slightly). Allowing `fp_prior` to **upgrade** a raw-failing segment was the bug.
+
+Fix: changed the gate from `adj_dist < T_STRICT` to `raw_dist < T_STRICT`. This preserves the legitimate borderline-Joe rescue case (`raw=0.50` with FP → still rescues) while blocking the heist-FP case (`raw=0.595` → no longer rescues regardless of `fp_adjust`).
+
+Net behavior on the phantom conv: 0 `fp_prior_rescue` invocations (vs 2 before fix); the 2 legitimate `hard_reject` phantom catches at `d=0.857`/`0.913` still fire correctly. No regression on the real-Joe conv (`02f66cd4-...`) — Jarvis-TTS still rescued via `strong_solo` at `d=0.138`.
+
+Regression test: `tests/unit/test_attribution.py::test_fp_prior_rescue_blocked_when_raw_above_t_strict`.
 
 ---
 
