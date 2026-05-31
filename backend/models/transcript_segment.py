@@ -35,6 +35,10 @@ class TranscriptSegment(BaseModel):
     translations: Optional[List[Translation]] = []
     speech_profile_processed: bool = True
     stt_provider: Optional[str] = None
+    # Layer 2 per-segment attribution provenance (written by utils.stt.attribution.attribute_user).
+    # Absence == legacy/un-attributed segment; presence == Layer 2 has run.
+    # Schema documented in docs/superpowers/specs/2026-05-31-memory-attribution-and-triage-design.md.
+    attribution: Optional[dict] = None
 
     def __init__(self, **data):
         super().__init__(**data)
