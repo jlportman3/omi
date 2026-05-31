@@ -15,8 +15,13 @@ from utils.http_client import get_stt_client
 
 logger = logging.getLogger(__name__)
 
-# Cosine distance threshold for speaker matching
-# Based on VoxCeleb 1 test set EER of 2.8%
+# Cosine distance threshold for speaker matching.
+# DEPRECATED: legacy fixed threshold based on VoxCeleb 1 test set EER of 2.8%.
+# Layer 2 attribution uses the per-user calibrated threshold stored in
+# `bank['calibrated_threshold']` (loaded via utils.stt.voiceprint_bank.load_voiceprint_bank)
+# alongside T_VOTE / T_STRONG_SOLO / T_HARD_REJECT constants owned by
+# utils.stt.attribution. New code MUST NOT reference this constant — it
+# remains here only for the pre-Layer-2 _match_speaker_embedding code path.
 SPEAKER_MATCH_THRESHOLD = 0.45
 
 # Minimum audio duration (seconds) for speaker embedding extraction.
