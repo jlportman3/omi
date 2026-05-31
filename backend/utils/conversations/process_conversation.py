@@ -461,8 +461,20 @@ def _extract_memories_inner(uid: str, conversation: Conversation):
             text_source = conversation.external_data.get('text_source', 'other')
             new_memories = extract_memories_from_text(uid, text_content, text_source, language=language)
     else:
-        # For regular conversations with transcript segments
-        new_memories = new_memories_extractor(uid, conversation.transcript_segments, language=language)
+        # For regular conversations with transcript segments.
+        # Layer 2 guardrail: only feed the memory extractor segments that are
+        # both is_user=True AND attribution.extractor_eligible=True. The
+        # extractor_eligible flag is False for borderline rescues (fp prior),
+        # hard rejects, and any segment whose raw distance is >= T_VOTE — those
+        # segments display correctly but must not produce phantom memories.
+        # Backward-compat: segments with attribution=None (legacy / pre-Layer-2)
+        # fall back to the old is_user-only filter.
+        eligible_segments = [
+            seg
+            for seg in conversation.transcript_segments
+            if seg.is_user and (seg.attribution is None or seg.attribution.get('extractor_eligible', False))
+        ]
+        new_memories = new_memories_extractor(uid, eligible_segments, language=language)
 
     is_locked = conversation.is_locked
     parsed_memories = []
