@@ -1,7 +1,7 @@
 # Memory Attribution and Autonomous Triage — Design
 
 **Date:** 2026-05-31
-**Status:** Design approved (brainstormed 2026-05-31), pending implementation plan
+**Status:** Design approved (brainstormed 2026-05-31). Layer 1 (voiceprint bank) deployed live to Jarvis on 2026-05-31 — 141 embeddings, calibrated_threshold=0.5430, version `bank-20260531-141828-11min-jarvis-enrollment`. Layers 2-6 pending implementation plan.
 **Owner:** Joe Portman (@jlportman3)
 **Scope:** Backend changes spanning `utils/stt/speaker_embedding.py`, `routers/transcribe.py`, `utils/conversations/process_conversation.py`, `database/memories.py`, `utils/prompts.py`, plus new `utils/memory_critic.py` and `scripts/rediarize.py`
 
@@ -76,17 +76,32 @@ Stored on the user doc as a new field (does not disturb the legacy `speaker_embe
 
 ```python
 voiceprint_bank: {
-    'version': 'bank-2026-05-31-15min-quiet',     # human-readable identifier
+    'version': 'bank-2026-05-31-141828-11min-jarvis-enrollment',  # human-readable identifier
     'created_at': <timestamp>,
-    'source_conversation_id': <conv_id>,            # the long enrollment conv
+    'source_conversation_ids': [<conv_id>, ...],    # list — enrollment can be split across multiple recordings
     'window_seconds': 10,
     'window_overlap_seconds': 5,
-    'embeddings': [[192 floats], [192 floats], ...],  # ~120 vectors
-    'calibrated_threshold': 0.34,                   # 95th percentile of intra-bank pairwise cosine distance + margin
-    'continual_samples': [],                        # populated over time by high-confidence is_user segments
-    'baseline_centroid': [192 floats],              # for drift detection
+    'sample_rate': 16000,
+    'embeddings': [                                  # NOTE: array of maps, not array of arrays
+        {'v': [192 floats]},                         # Firestore disallows arrays directly nested in arrays;
+        {'v': [192 floats]},                         # wrapping each embedding in a {'v': ...} map dodges
+        ...                                          # the restriction without splitting into a subcollection
+    ],
+    'calibrated_threshold': 0.54,                   # 95th percentile of intra-bank pairwise cosine distance + 0.05 margin
+    'continual_samples': [],                        # same {'v': [192 floats]} shape when populated
+    'baseline_centroid': [192 floats],              # flat single-level array — Firestore allows this
+    'stats': {                                       # observability snapshot at build time
+        'n_embeddings': 141,
+        'total_duration_s': 710.9,
+        'intra_pairwise_min': 0.032,
+        'intra_pairwise_mean': 0.234,
+        'intra_pairwise_p95': 0.493,
+        'intra_pairwise_max': 0.642,
+    },
 }
 ```
+
+**Firestore nesting note:** Firestore rejects arrays-directly-inside-arrays (`[[…], […]]`). All embedding lists are wrapped in `{'v': [...]}` maps so the outer container is `array of maps`, which Firestore allows. The verified live bank for Jarvis (built 2026-05-31, 141 embeddings) uses this shape successfully — do NOT "simplify" back to `[[…], […]]` in implementations.
 
 Same schema applies to enrolled people (`users/{uid}/people/{person_id}.voiceprint_bank`), populated when sufficient speech samples accumulate.
 
@@ -96,7 +111,9 @@ For each query embedding (a segment to be attributed):
 
 ```python
 def match_user(query_embedding, voiceprint_bank) -> tuple[float, bool]:
-    distances = [cosine(query_embedding, e) for e in voiceprint_bank['embeddings'] + voiceprint_bank['continual_samples']]
+    # Unwrap the map-wrap on read
+    bank_vectors = [e['v'] for e in voiceprint_bank['embeddings'] + voiceprint_bank.get('continual_samples', [])]
+    distances = [cosine(query_embedding, v) for v in bank_vectors]
     nearest_distance = min(distances)
     is_match = nearest_distance < voiceprint_bank['calibrated_threshold']
     return nearest_distance, is_match
