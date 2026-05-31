@@ -116,6 +116,15 @@ from utils.stt.speaker_embedding import (
     compare_embeddings,
     SPEAKER_MATCH_THRESHOLD,
 )
+
+# Layer 2 attribution wiring. These modules are created by the Layer 2 NewModules
+# phase; importing them here lets transcribe.py call attribute_user() per
+# cluster-flush and load the per-user voiceprint bank once per WS connection.
+# The legacy _match_speaker_embedding code path below is kept as fallback for
+# users without a bank (no speech profile / pre-Layer-2 accounts); when a bank
+# exists, attribute_user() owns the is_user decision per segment.
+from utils.stt.voiceprint_bank import load_voiceprint_bank
+from utils.stt.attribution import attribute_user, FIRST_PERSON_RE, T_VOTE, K_MAX
 from utils.speaker_sample_migration import maybe_migrate_person_samples
 from utils.log_sanitizer import sanitize, sanitize_pii
 
@@ -375,6 +384,13 @@ async def _stream_handler(
     speaker_id_enabled = False  # Will be set after private_cloud_sync_enabled is known
     speaker_id_done = asyncio.Event()  # Set when speaker_identification_task finishes
     speaker_map_dirty = False  # Set when a new match is added; triggers one-time full-segment pass
+
+    # Layer 2 attribution: per-connection voiceprint bank cache. Loaded lazily on
+    # first cluster-flush via _get_voiceprint_bank() so connections without speaker
+    # ID or for users with no bank don't pay the Firestore read cost. Tuple of
+    # (bank_dict, version) — None when load failed or user has no bank.
+    voiceprint_bank_cache: Optional[dict] = None
+    voiceprint_bank_loaded: bool = False  # True once we've attempted to load (success or miss)
 
     # Track background tasks to cancel on cleanup (prevents memory leaks from fire-and-forget tasks)
     bg_tasks: Set[asyncio.Task] = set()
@@ -1745,6 +1761,30 @@ async def _stream_handler(
     # Sentinel person_id for user's own voice — must match speaker_assignment.py's 'user' sentinel
     USER_SELF_PERSON_ID = 'user'
 
+    async def _get_voiceprint_bank() -> Optional[dict]:
+        """Lazy per-connection load of the Layer 2 voiceprint bank from Firestore.
+
+        Returns the cached bank dict on subsequent calls. None when the user has no
+        bank (legacy account / no speech profile) — callers fall back to the
+        pre-Layer-2 _match_speaker_embedding path.
+        """
+        nonlocal voiceprint_bank_cache, voiceprint_bank_loaded
+        if voiceprint_bank_loaded:
+            return voiceprint_bank_cache
+        try:
+            voiceprint_bank_cache = await asyncio.to_thread(load_voiceprint_bank, uid)
+        except Exception as e:
+            logger.warning(f"Layer 2: voiceprint bank load failed: {e} {uid} {session_id}")
+            voiceprint_bank_cache = None
+        voiceprint_bank_loaded = True
+        if voiceprint_bank_cache:
+            logger.info(
+                f"Layer 2: loaded voiceprint bank version={voiceprint_bank_cache.get('version')} "
+                f"T_STRICT={voiceprint_bank_cache.get('calibrated_threshold')} "
+                f"T_VOTE={T_VOTE} K_MAX={K_MAX} {uid} {session_id}"
+            )
+        return voiceprint_bank_cache
+
     async def speaker_identification_task():
         """Consume segment queue, accumulate per speaker, trigger match when ready."""
         nonlocal websocket_active, speaker_to_person_map
@@ -1847,7 +1887,20 @@ async def _stream_handler(
         speaker_id_done.set()
 
     async def _match_speaker_embedding(speaker_id: int, segment: dict):
-        """Extract audio from ring buffer and match against stored embeddings."""
+        """Extract audio from ring buffer and match against stored embeddings.
+
+        Pre-Layer-2 path: single-segment cosine match against
+        ``person_embeddings_cache`` using the legacy fixed
+        ``SPEAKER_MATCH_THRESHOLD=0.45``. Used for users who have no voiceprint
+        bank yet (legacy accounts / no speech profile) and for the
+        person_embeddings_cache contact-matching side of the lookup.
+
+        Layer 2 attribution (utils.stt.attribution.attribute_user) supersedes
+        this for the USER_SELF_PERSON_ID decision when a bank is available — it
+        runs per cluster-flush with sub-window embeds, cluster vote, strong-solo
+        override, bimodal split detection, and first-person prior, writing
+        per-segment provenance to ``segment.attribution``.
+        """
         nonlocal speaker_to_person_map, segment_person_assignment_map, audio_ring_buffer, speaker_map_dirty
 
         try:
@@ -2112,9 +2165,23 @@ async def _stream_handler(
                 newly_processed_segments = []
                 for s in segments_to_process:
                     segment = TranscriptSegment(**s, speech_profile_processed=True)
-                    # In onboarding mode, force is_user=True for non-Omi segments (user's answers)
+                    # In onboarding mode, force is_user=True for non-Omi segments (user's answers).
+                    # Layer 2 attribution is BYPASSED in onboarding — onboarding answers are
+                    # ground-truth and feed the bank; attribute_user is not called for them.
                     if onboarding_mode and s.get('speaker_id') != OnboardingHandler.OMI_SPEAKER_ID:
                         segment.is_user = True
+                    else:
+                        # Layer 2 Stage 3 cheap path: first-person regex is sub-millisecond,
+                        # safe to run at finalize before any audio-based attribution. Full
+                        # attribute_user() (with sub-window embeds + cluster vote) runs at
+                        # cluster flush; here we just stamp the first_person_present bit so
+                        # downstream consumers (and the rescue branch in attribute_user) see
+                        # a populated attribution dict even when audio attribution is async.
+                        if segment.attribution is None:
+                            segment.attribution = {}
+                        fp_present = bool(FIRST_PERSON_RE.search(segment.text or ''))
+                        segment.attribution['first_person_present'] = fp_present
+                        segment.attribution['fp_adjust'] = 0.0
                     newly_processed_segments.append(segment)
                 words_transcribed = len(" ".join([seg.text for seg in newly_processed_segments]).split())
                 if words_transcribed > 0:
