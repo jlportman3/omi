@@ -1,9 +1,9 @@
 # Memory Attribution and Autonomous Triage — Design
 
 **Date:** 2026-05-31
-**Status:** Design approved (brainstormed 2026-05-31). Layer 1 (voiceprint bank) deployed live to Jarvis on 2026-05-31 — 141 embeddings, calibrated_threshold=0.5430, version `bank-20260531-141828-11min-jarvis-enrollment`. Layers 2-6 pending implementation plan.
+**Status:** Design approved (brainstormed 2026-05-31). Layer 1 (voiceprint bank) deployed live to Jarvis on 2026-05-31 and augmented the same day with 5 in-the-wild Joe samples (including 1 Jarvis-TTS sample empirically confirmed as Joe-voice). Current bank: **146 embeddings** (141 enrollment + 5 continual), **calibrated_threshold=0.5473**, version `bank-20260531-150319-augmented-141+5`. **Layer 2 algorithm now fully specified** (see Layer 2 section) — cluster-vote with strong-solo override, bimodal split detection, and first-person soft prior. Layers 3-6 pending implementation plan.
 **Owner:** Joe Portman (@jlportman3)
-**Scope:** Backend changes spanning `utils/stt/speaker_embedding.py`, `routers/transcribe.py`, `utils/conversations/process_conversation.py`, `database/memories.py`, `utils/prompts.py`, plus new `utils/memory_critic.py` and `scripts/rediarize.py`
+**Scope:** Backend changes spanning `utils/stt/speaker_embedding.py`, `routers/transcribe.py`, `utils/conversations/process_conversation.py`, `database/memories.py`, `utils/prompts.py`, plus new `utils/stt/attribution.py`, `utils/stt/voiceprint_bank.py`, `utils/memory_critic.py`, and `scripts/rediarize.py`
 
 ---
 
@@ -76,7 +76,7 @@ Stored on the user doc as a new field (does not disturb the legacy `speaker_embe
 
 ```python
 voiceprint_bank: {
-    'version': 'bank-2026-05-31-141828-11min-jarvis-enrollment',  # human-readable identifier
+    'version': 'bank-20260531-150319-augmented-141+5',  # human-readable identifier; bumps on augmentation
     'created_at': <timestamp>,
     'source_conversation_ids': [<conv_id>, ...],    # list — enrollment can be split across multiple recordings
     'window_seconds': 10,
@@ -87,23 +87,36 @@ voiceprint_bank: {
         {'v': [192 floats]},                         # wrapping each embedding in a {'v': ...} map dodges
         ...                                          # the restriction without splitting into a subcollection
     ],
-    'calibrated_threshold': 0.54,                   # 95th percentile of intra-bank pairwise cosine distance + 0.05 margin
-    'continual_samples': [],                        # same {'v': [192 floats]} shape when populated
+    'calibrated_threshold': 0.5473,                 # 95th percentile of intra-bank pairwise cosine distance + 0.05 margin
+    'continual_samples': [                          # same {'v': [192 floats]} shape, plus metadata
+        {'v': [192 floats], 'label': 'Joe_22.38-40.89', 'duration_s': 18.51,
+         'distance_to_old_bank': 0.272, 'source_conversation_id': '...', 'source_audio_file_id': '...'},
+        # ... 4 more (3 Joe in-the-wild + 1 Jarvis-TTS = Joe's cloned voice)
+    ],
     'baseline_centroid': [192 floats],              # flat single-level array — Firestore allows this
-    'stats': {                                       # observability snapshot at build time
-        'n_embeddings': 141,
-        'total_duration_s': 710.9,
-        'intra_pairwise_min': 0.032,
-        'intra_pairwise_mean': 0.234,
-        'intra_pairwise_p95': 0.493,
-        'intra_pairwise_max': 0.642,
+    'stats': {                                       # observability snapshot — post-augmentation
+        'n_embeddings': 146,                         # 141 enrollment + 5 continual
+        'total_duration_s': 784.4,                   # 710.9 + 73.5 from the 5 continual samples
+        'intra_pairwise_min': 0.0318,
+        'intra_pairwise_mean': 0.2445,
+        'intra_pairwise_p95': 0.4973,
+        'intra_pairwise_max': 0.7537,
     },
 }
 ```
 
-**Firestore nesting note:** Firestore rejects arrays-directly-inside-arrays (`[[…], […]]`). All embedding lists are wrapped in `{'v': [...]}` maps so the outer container is `array of maps`, which Firestore allows. The verified live bank for Jarvis (built 2026-05-31, 141 embeddings) uses this shape successfully — do NOT "simplify" back to `[[…], […]]` in implementations.
+**Firestore nesting note:** Firestore rejects arrays-directly-inside-arrays (`[[…], […]]`). All embedding lists are wrapped in `{'v': [...]}` maps so the outer container is `array of maps`, which Firestore allows. The verified live bank for Jarvis (built 2026-05-31, originally 141 embeddings, augmented same day to 146) uses this shape successfully — do NOT "simplify" back to `[[…], […]]` in implementations.
 
 Same schema applies to enrolled people (`users/{uid}/people/{person_id}.voiceprint_bank`), populated when sufficient speech samples accumulate.
+
+### Jarvis-TTS = Joe's cloned voice (not a false positive)
+
+The Jarvis AI persona that this test account interacts with uses a **text-to-speech voice that was cloned from Joe's own voice**. Acoustically, when Jarvis "speaks" through omi-pickup, it is Joe's voiceprint coming out of a speaker. The 2026-05-31 sweep confirmed this empirically: the Jarvis-TTS sample at `Conv A 272.11-289.21` lands at cosine distance **0.1925** to the original 141-embedding bank — closer than any of the 4 hand-validated in-the-wild Joe segments (which sit at 0.27-0.34).
+
+This has two design consequences carried through the rest of the layers:
+
+1. **Augmentation is welcome, not contaminating.** Jarvis-TTS segments captured by omi-pickup are added to `continual_samples` exactly like real in-the-wild Joe speech. They reinforce the bank rather than poisoning it. The augmented bank now contains 1 such sample (labeled `JarvisTTS_272.11-289.21`).
+2. **`is_user=True` on Jarvis-TTS audio is correct.** Downstream code MUST NOT treat "the speaker_id is tagged as Jarvis but the voiceprint matched the user" as a contradiction or a false positive. The Layer 2 attribution pipeline accepts Jarvis-TTS as Joe by design, with provenance recording the strong distance match. The memory extractor, however, still applies first-person + corroboration guardrails (Layer 4) so we don't extract "facts about Joe" from prompts/scripted output Jarvis happens to say in Joe's voice — extraction is gated on *content*, not just attribution.
 
 ### Matching
 
@@ -119,7 +132,7 @@ def match_user(query_embedding, voiceprint_bank) -> tuple[float, bool]:
     return nearest_distance, is_match
 ```
 
-K-NN against ~120-200 vectors is microseconds in numpy. Threshold is **per-user, data-driven** — anyone outside your natural intra-voice variance is rejected.
+K-NN against ~120-200 vectors is microseconds in numpy (current live bank: 146 vectors × 192 dims, ~50µs per lookup). Threshold is **per-user, data-driven** — anyone outside your natural intra-voice variance is rejected.
 
 ### Continual learning + drift detection
 
@@ -129,37 +142,361 @@ Periodically, compute the centroid of `continual_samples` and compare to `baseli
 
 ---
 
-## Layer 2: Per-segment attribution algorithm
+## Validation results (2026-05-31)
 
-Replaces the cluster-level decision in `routers/transcribe.py:_match_speaker_embedding` with per-segment + corroboration + cluster split.
+Before designing Layer 2 we validated Layer 1 against two reference conversations from the Jarvis test account and ran a threshold sweep against the augmented bank.
 
-### Algorithm
+### Phantom rejection — clean
 
-For each speaker-clustered group from Deepgram (or future Sortformer):
+Test conversation B (`d5b9087e-bd5e-45e8-a7e8-2b67ca76684b`) is a TV-debate recording with 18 distinct speaker clusters captured by omi. We pulled one representative segment per non-user speaker (12 distinct TV speakers) and ran each through `match_user`:
 
-1. **Sub-window embed**: split the cluster into 2-3s sub-windows; embed each via voice-extras
-2. **Per-window match**: each sub-window gets `(nearest_distance, is_user_match)` against the user's voiceprint bank
-3. **Corroboration window**: with default **N=2 of M=3** consecutive sub-windows required to match before locking `is_user=True`. Single-window matches don't trigger memory extraction (they may still be tagged for display, but `corroboration_count = 1` flags them downstream)
-4. **Cluster split refinement**: if a Deepgram cluster has mixed sub-window matches (some pass corroboration, some fail), split the cluster:
-   - Passing sub-windows form a new "user" cluster
-   - Failing sub-windows form a demoted "unattributed" cluster
-   - Both retain audio range references for traceability
-5. **Per-segment metadata written to the segment**: `attribution_distance`, `corroboration_count`, `voiceprint_version`
+| Metric | Result |
+|---|---|
+| Controls admitted at original threshold (0.5430) | **0 / 12** |
+| Min cosine distance across all 12 controls | 0.6271 |
+| Median distance | 0.83 |
+| Max distance | 0.9391 |
 
-### Defaults (env-overridable)
+The bank **rejects unrelated speakers cleanly** — no phantom admission risk on TV-style ambient audio. The two borderline controls (`SPEAKER_3` at 0.6271, `SPEAKER_1` at 0.6634) are the practical ceiling on how far the threshold can be pushed before false-accept rate becomes a concern.
 
-- `CORROBORATION_N = 2`
-- `CORROBORATION_M = 3`
-- `SUB_WINDOW_SECONDS = 2.5`
-- `USE_CLUSTER_SPLIT = true`
+### Joe recall — bimodal failure on wearable audio
+
+Test conversation A (`02f66cd4-682a-4ecb-b096-2a771110b29a`) is a casual conversation about omi/Qwen vision, with 14 user-tagged Joe segments + 1 Jarvis-TTS segment (Joe-voice cloned). Validation against the original 141-embedding bank at threshold 0.5430:
+
+| Metric | Result |
+|---|---|
+| Joe segments admitted | **4 / 14 (28.6%)** |
+| Joe false-negative rate | **71.4%** |
+| Jarvis-TTS distance | 0.1925 (would be admitted — and correctly so; it IS Joe) |
+
+The 10 false-negative Joe segments all cluster at **distances 0.64-0.74** — a striking bimodal gap from the 5 hand-validated Joe samples at 0.27-0.34. The acoustic mismatch is enrollment-conditions (quiet room, fixed mic distance, formal speech) vs. wearable-conditions (BLE pendant, ambient noise, casual cadence). The original bank covers one acoustic mode of Joe's voice but not the other.
+
+**Mitigation applied:** the 4 high-confidence Joe segments + the 1 Jarvis-TTS segment were written into `continual_samples` (Layer 1's continual-learning path). New bank version `bank-20260531-150319-augmented-141+5` carries 146 embeddings and threshold 0.5473. All 5 new samples were already inside the old threshold (max distance 0.337), so augmentation only nudges the threshold by ~0.004 — the bimodal gap is NOT closed by augmentation alone. Layer 2's **cluster cohesion / cluster vote** is what bridges the gap (see Layer 2).
+
+### Threshold sweep against augmented bank (146 embeddings)
+
+LOO-honest sweep (leave-one-out on the 5 continual samples, so they don't trivially self-match at distance 0.0):
+
+| Threshold | Conv A Joe recall | Conv B is_user accept | Conv B controls rejected | F1 |
+|---:|:---:|:---:|:---:|---:|
+| 0.50 | 5 / 15 (33%) | 11 / 22 | **12 / 12 (100%)** | 0.500 |
+| 0.55 | 5 / 15 (33%) | 11 / 22 | 12 / 12 (100%) | 0.500 |
+| 0.60 | 5 / 15 (33%) | 11 / 22 | 12 / 12 (100%) | 0.500 |
+| 0.65 | 6 / 15 (40%) | 12 / 22 | 11 / 12 (92%) | 0.557 |
+| **0.70** | **11 / 15 (73%)** | **13 / 22** | **10 / 12 (83%)** | **0.780** |
+| 0.75 | 15 / 15 (100%) | 13 / 22 | 10 / 12 (83%) | 0.909 |
+
+(Conv B's 22 is_user segments are themselves bimodal: 11 at 0.15-0.48 are real Joe; the other 11 at 0.65-0.92 overlap the TV-control distribution and are almost certainly Deepgram mistakes — Layer 2 correctly rejects them.)
+
+### Recommended operating threshold: **0.70** (per-segment) — Layer 2 modifies it
+
+Pure F1 favors 0.75, but at that threshold the 4 extra Conv A segments that get accepted live in the same 0.69-0.74 distance band as 2 borderline controls. **T=0.70 is the safest single-threshold operating point**: catches all 5 strong-match Joe samples + the 6 closest in-the-wild Joe segments (11/15 honest recall), rejects 10/12 controls, leaves an 0.07 margin to the nearest TV speaker.
+
+Crucially, **thresholding alone is insufficient**. Even at T=0.70 we lose 4 Conv A Joe segments (the deepest-bimodal ones at 0.70-0.74) and accept 2 borderline TV speakers (0.627, 0.663). The structural fix is Layer 2:
+
+- The 4 lost Joe segments live in the **same Deepgram speaker_id cluster** as the 5 strong matches → cluster cohesion can rescue them.
+- The 2 borderline TV speakers live in clusters that are **otherwise entirely non-Joe** → cluster cohesion rejects them.
+
+Layer 2 therefore uses T=0.5473 (the calibrated bank threshold) as `T_STRICT` for solo per-segment matches, plus T=0.70 as `T_VOTE` for cluster-vote relaxed matches — the two thresholds work together rather than picking one.
+
+---
+
+## Layer 2: Per-segment attribution with cluster vote, strong-solo override, and split detection
+
+Replaces the cluster-level single-embedding decision in `routers/transcribe.py:_match_speaker_embedding` with a **per-segment + cluster-vote hybrid** that synthesizes the best ideas from three brainstormed designs:
+
+- **Cluster-vote core** (cheap, naturally aligned with Deepgram/Sortformer output, robust to single-segment noise)
+- **Strong-solo override** for very-close matches like cloned-voice Jarvis-TTS (distance 0.19) — one segment IS enough at that confidence
+- **Bimodal split detection** to catch Deepgram cluster-merge bugs (two real speakers fused into one `speaker_id`) without re-running diarization
+- **First-person language soft prior** as a tiebreaker in the borderline distance band only — cannot override clear decisions
+
+Skipped from the brainstorm: complex real-time temporal sliding-window re-attribution (Design 1's neighbor-window mechanism) — too much state-keeping for the live pipeline, and Deepgram cluster cohesion already provides the same recall benefit at lower complexity.
+
+### Tunable constants (env-overridable defaults)
+
+```python
+T_STRICT                = bank['calibrated_threshold']  # 0.5473 — per-segment solo accept
+T_VOTE                  = 0.70                          # cluster-vote relaxed accept
+T_HARD_REJECT           = 0.85                          # above this nothing escapes (even cluster vote)
+T_STRONG_SOLO           = 0.30                          # single-segment auto-accept (cloned voice band)
+T_CLUSTER_SPLIT_GAP     = 0.20                          # bimodal gap in sorted intra-cluster distances
+T_CLUSTER_SPLIT_DELTA   = 0.10                          # min |mean(low) - mean(high)| for valid split
+CLUSTER_MAJORITY_RATIO  = 0.50                          # >= this fraction of weighted sub-windows pass T_VOTE => user cluster
+CLUSTER_MINORITY_RATIO  = 0.20                          # <= this fraction => not-user cluster
+K_MAX                   = 5                             # max sub-windows sampled per cluster
+SUB_WINDOW_SECONDS      = 2.5
+SUB_WINDOW_OVERLAP      = 0.5
+MIN_EMBED_DURATION      = 0.5                           # voice-extras hard floor
+FP_PRIOR_BONUS          = -0.05                         # first-person language present -> nudge toward user
+FP_PRIOR_PENALTY        = +0.05                         # no FP language AND borderline -> nudge away from user
+FP_BORDERLINE_BAND      = (T_STRICT - 0.10, T_VOTE)     # FP prior only acts inside this band
+FIRST_PERSON_RE = re.compile(
+    r"\b(I|I['’]m|I['’]ve|I['’]d|I['’]ll|my|me|mine|myself)\b",
+    re.IGNORECASE,
+)
+```
+
+### Algorithm pseudocode
+
+```python
+def attribute_user(transcript_segments, bank, audio_pcm, sample_rate=16000):
+    """
+    Full Layer 2 attribution pipeline. Same code runs real-time (per cluster-flush)
+    and batch (per conversation). Pure function: no Firestore I/O, no httpx —
+    callers provide bank dict + audio bytes.
+
+    Mutates each segment in place:
+        seg.is_user        : bool
+        seg.attribution    : dict (provenance — see Layer 3)
+    """
+    bank_vecs = np.array(
+        [e['v'] for e in bank['embeddings']]
+        + [e['v'] for e in bank.get('continual_samples', [])],
+        dtype=np.float32,
+    )
+
+    # ----- STAGE 0: sub-window embed every segment (skip if < MIN_EMBED_DURATION) -----
+    for seg in transcript_segments:
+        seg._sub = []
+        if (seg.end - seg.start) < MIN_EMBED_DURATION:
+            continue
+        for ws, we in slide_sub_windows(seg.start, seg.end,
+                                        SUB_WINDOW_SECONDS, SUB_WINDOW_OVERLAP,
+                                        MIN_EMBED_DURATION):
+            wav = pcm_slice_to_wav(audio_pcm, ws, we, sample_rate)
+            try:
+                emb = post_titanet(wav)                              # (192,) float32
+                d   = float(cdist([emb], bank_vecs, 'cosine').min())
+            except Exception:
+                emb, d = None, None
+            seg._sub.append({'start': ws, 'end': we, 'dist': d, 'emb': emb})
+
+    # ----- STAGE 1: per-segment representative distance + strong-solo flag -----
+    for seg in transcript_segments:
+        valid = [s for s in seg._sub if s.get('dist') is not None]
+        seg._raw_dist     = min((s['dist'] for s in valid), default=None)
+        seg._strong_solo  = (seg._raw_dist is not None
+                             and seg._raw_dist < T_STRONG_SOLO)
+
+    # ----- STAGE 2: cluster vote + bimodal split detection -----
+    clusters = defaultdict(list)
+    for seg in transcript_segments:
+        clusters[seg.speaker_id].append(seg)
+
+    for sid, members in clusters.items():
+        all_subs = [s for m in members for s in m._sub if s.get('dist') is not None]
+        if not all_subs:
+            for m in members:
+                m._cluster_decision = 'other'
+                m._cluster_split    = False
+            continue
+
+        # Sample at most K_MAX sub-windows per cluster (longest first, ties by start_time)
+        # to bound voice-extras cost on long clusters. Stage 0 already embedded everything;
+        # K_MAX here only caps which sub-windows participate in the VOTE.
+        sampled = sorted(all_subs, key=lambda s: (-(s['end']-s['start']), s['start']))[:K_MAX]
+
+        # Weighted pass-ratio (duration-weighted; 0.5s blips don't outvote 2.5s windows)
+        w_pass = sum((s['end']-s['start']) for s in sampled if s['dist'] < T_VOTE)
+        w_all  = sum((s['end']-s['start']) for s in sampled)
+        pass_ratio = w_pass / w_all if w_all else 0.0
+
+        # Bimodal split detection — find the largest gap in sorted distances
+        is_mixed = False
+        split_threshold = None
+        if len(sampled) >= 4:
+            dists  = sorted(s['dist'] for s in sampled)
+            gaps   = [(dists[i+1] - dists[i], i) for i in range(len(dists)-1)]
+            mg, gi = max(gaps)
+            low_mean  = mean(dists[:gi+1])
+            high_mean = mean(dists[gi+1:])
+            if (mg >= T_CLUSTER_SPLIT_GAP
+                and (high_mean - low_mean) >= T_CLUSTER_SPLIT_DELTA
+                and low_mean  < T_VOTE
+                and high_mean > T_VOTE):
+                is_mixed = True
+                split_threshold = (low_mean + high_mean) / 2.0
+
+        # Decision tree
+        if is_mixed:
+            # Per-segment routing: each segment goes to the mode its raw_dist is nearest
+            for m in members:
+                m._cluster_decision = ('user' if (m._raw_dist is not None
+                                                  and m._raw_dist < split_threshold)
+                                              else 'other')
+                m._cluster_split    = True
+        elif pass_ratio >= CLUSTER_MAJORITY_RATIO:
+            for m in members:
+                m._cluster_decision = 'user'
+                m._cluster_split    = False
+        elif pass_ratio <= CLUSTER_MINORITY_RATIO:
+            for m in members:
+                m._cluster_decision = 'other'
+                m._cluster_split    = False
+        else:
+            # Ambiguous (20-50% pass): fall back to per-segment decision under T_STRICT
+            for m in members:
+                m._cluster_decision = ('user' if (m._raw_dist is not None
+                                                  and m._raw_dist < T_STRICT)
+                                              else 'other')
+                m._cluster_split    = False
+
+    # ----- STAGE 3: first-person language soft prior (borderline only) -----
+    for seg in transcript_segments:
+        has_fp = bool(FIRST_PERSON_RE.search(seg.text or ''))
+        seg._fp_present = has_fp
+        seg._fp_adjust  = 0.0
+        d = seg._raw_dist
+        if d is None:
+            seg._adj_dist = None
+            continue
+        adj = d
+        if FP_BORDERLINE_BAND[0] <= d <= FP_BORDERLINE_BAND[1]:
+            if has_fp:
+                adj += FP_PRIOR_BONUS
+                seg._fp_adjust = FP_PRIOR_BONUS
+            else:
+                adj += FP_PRIOR_PENALTY
+                seg._fp_adjust = FP_PRIOR_PENALTY
+        seg._adj_dist = adj
+
+    # ----- STAGE 4: final decision + provenance write -----
+    for seg in transcript_segments:
+        # 1. Hard reject: nothing above T_HARD_REJECT survives, regardless of cluster
+        if seg._raw_dist is not None and seg._raw_dist >= T_HARD_REJECT:
+            final, reason = False, 'hard_reject'
+        # 2. Strong solo override: very-close match accepts even from a single seg
+        #    (handles Jarvis-TTS = Joe's cloned voice at distance 0.19)
+        elif seg._strong_solo:
+            final, reason = True, 'strong_solo'
+        # 3. Cluster vote dominant
+        elif seg._cluster_decision == 'user':
+            final  = True
+            reason = 'cluster_split_lower_mode' if seg._cluster_split else 'cluster_vote_user'
+        # 4. Borderline rescue: cluster said 'other' but FP-adjusted distance crosses T_STRICT
+        elif (seg._adj_dist is not None
+              and seg._adj_dist < T_STRICT
+              and FP_BORDERLINE_BAND[0] <= (seg._raw_dist or 1.0) <= FP_BORDERLINE_BAND[1]
+              and seg._fp_present):
+            final, reason = True, 'fp_prior_rescue'
+        else:
+            final, reason = False, 'cluster_other'
+
+        seg.is_user = final
+        seg.attribution = {
+            'voiceprint_version':     bank['version'],
+            'algo_version':           'layer2-cluster-vote-v1',
+            'distance_raw':           seg._raw_dist,
+            'distance_after_prior':   seg._adj_dist,
+            'n_sub_windows':          len(seg._sub),
+            'cluster_id':             seg.speaker_id,
+            'cluster_decision':       seg._cluster_decision,
+            'cluster_split_detected': seg._cluster_split,
+            'strong_solo':            seg._strong_solo,
+            'first_person_present':   seg._fp_present,
+            'fp_adjust':              seg._fp_adjust,
+            'decision_reason':        reason,
+            # Layer 4 gates extraction on this combined flag:
+            'extractor_eligible':     (final
+                                       and seg._raw_dist is not None
+                                       and seg._raw_dist < T_VOTE),
+        }
+        # Hygiene: drop intermediate fields before persistence
+        for k in ('_sub', '_raw_dist', '_strong_solo',
+                  '_cluster_decision', '_cluster_split',
+                  '_fp_present', '_fp_adjust', '_adj_dist'):
+            seg.__dict__.pop(k, None)
+    return transcript_segments
+```
+
+### Integration points
+
+| File | Change |
+|---|---|
+| **`backend/utils/stt/voiceprint_bank.py` (NEW)** | `load_voiceprint_bank(uid)` (Firestore read + np.stack of `{'v':...}`-wrapped vectors, per-process LRU cache keyed on `(uid, version)`); `match_against_bank(emb, bank) -> (distance, is_match)`. Keeps `speaker_embedding.py` focused on the wespeaker/titanet HTTP boundary. |
+| **`backend/utils/stt/attribution.py` (NEW)** | Houses the four-stage pipeline above. Pure functions, no I/O — fully unit-testable with synthetic segment lists. Imported by both live `transcribe.py` and batch `scripts/rediarize.py` so they produce **identical** attributions given the same audio + bank version. |
+| **`backend/utils/stt/speaker_embedding.py`** | Add module-level Layer 2 constants (env-overridable). Mark legacy `SPEAKER_MATCH_THRESHOLD=0.45` deprecated in favor of `bank['calibrated_threshold']`. Existing `async_extract_embedding_from_bytes` reused unchanged. |
+| **`backend/routers/transcribe.py` (real-time path, ~L1748-1995)** | Replace `speaker_identification_task` + `_match_speaker_embedding`. Per cluster, buffer arriving segments until either (a) K_MAX usable sub-windows accumulated, or (b) cluster silent for 6s, or (c) conversation flush. Then call `attribute_user(cluster_segments, bank, audio_ring_buffer)`. Emit `SpeakerLabelSuggestionEvent` for every segment whose `is_user` flipped from a prior tentative value. Debounce flip events on cluster decision changes only (not on every sub-window arrival). |
+| **`backend/routers/transcribe.py` (~L2114, segment finalize)** | After Deepgram marks a segment final, run Stage 3 (FP prior, regex only, sub-millisecond) and update `segment.attribution.first_person_present / fp_adjust` before persistence. |
+| **`backend/scripts/rediarize.py` (NEW, batch path)** | Layer 6 driver. Walks conversations, downloads merged audio via `get_or_create_merged_audio()`, calls `attribute_user(segments, bank, audio_pcm)`, writes per-segment provenance back to Firestore. Same algorithm as live — single source of truth. |
+| **`backend/utils/conversations/process_conversation.py`** | Memory-extractor input filter changes from `seg.is_user` to `seg.is_user and seg.attribution.get('extractor_eligible', False)`. Segments rescued only by `fp_prior_rescue` (no `extractor_eligible`) still display correctly but are **not** eligible to produce memories — Layer 4 guardrail. |
+| **`backend/models/transcript_segment.py`** | Add optional `attribution: Optional[dict] = None` field. Absence == legacy/un-attributed; presence == Layer 2 has run. Plaintext (no PII). |
+| **`backend/tests/unit/test_attribution.py` (NEW)** | Unit tests: K_MAX truncation, longest-first determinism, majority/minority/ambiguous thresholds, bimodal split detection on synthetic distance distributions, FP regex coverage (ASCII + curly apostrophes), hard-reject vs strong-solo vs cluster-vote vs fp-rescue branches, end-to-end fixture using the Conv A / Conv B distance distributions from the 2026-05-31 sweep. |
+| **`backend/tests/integration/test_attribution_live.py` (NEW)** | Integration test against the two reference conversations + live bank. Asserts: Conv A's Joe cluster votes user with strong-solo override on the 5 augmented samples; Conv B's 12 control clusters all reject; Jarvis-TTS segment passes via strong-solo. Uses the real rtx6000 voice-extras endpoint. |
+
+### Provenance schema — extension to Layer 3
+
+Layer 2 produces per-segment provenance that Layer 3 must surface on the segment doc. Extend the existing Layer 3 schema (`provenance` block on `transcript_segments`) with the new `attribution` field exactly as written by `attribute_user`:
+
+```python
+seg.attribution = {
+    'voiceprint_version':     'bank-20260531-150319-augmented-141+5',
+    'algo_version':           'layer2-cluster-vote-v1',
+    'distance_raw':           float | None,    # nearest sub-window distance
+    'distance_after_prior':   float | None,    # raw + fp_adjust (only differs in borderline band)
+    'n_sub_windows':          int,
+    'cluster_id':             int | str,       # Deepgram or future Sortformer ID
+    'cluster_decision':       'user' | 'other',
+    'cluster_split_detected': bool,            # True when bimodal split fired
+    'strong_solo':            bool,            # raw_dist < T_STRONG_SOLO
+    'first_person_present':   bool,
+    'fp_adjust':              float,           # 0.0 outside borderline band
+    'decision_reason':        'hard_reject' | 'strong_solo' | 'cluster_vote_user'
+                              | 'cluster_split_lower_mode' | 'fp_prior_rescue' | 'cluster_other',
+    'extractor_eligible':     bool,            # consumed by Layer 4
+}
+```
+
+Memory-doc-level `provenance.attribution_distance` and `provenance.corroboration_count` (already defined in Layer 3) are computed at extraction time from the cited source segments' `attribution.distance_raw` and `attribution.n_sub_windows` respectively — no further schema changes needed on the memory side.
+
+### Edge cases handled
+
+- **Segment < MIN_EMBED_DURATION (0.5s):** no embedding produced (`distance_raw=None`). Cluster decision still applies if other segments in the cluster were embedded. If the entire cluster is sub-threshold-short, decision defaults to `'other'` (safe default — no audio evidence).
+- **Single-segment cluster (K=1):** no cluster-vote benefit; falls back to per-segment T_STRICT decision plus strong-solo override. `attribution.cluster_split_detected=False` always.
+- **Cluster with only short segments:** stage 0 yields no usable embeddings; stage 2 sets `cluster_decision='other'`; no false acceptances on inaudible fragments.
+- **Bimodal cluster (Deepgram merged Joe + TV):** split detection requires ≥4 sub-windows AND a sorted-distance gap ≥ T_CLUSTER_SPLIT_GAP (0.20) AND mean delta ≥ T_CLUSTER_SPLIT_DELTA (0.10) AND low_mean < T_VOTE AND high_mean > T_VOTE. When all four hold, each segment routes to whichever mode its `raw_dist` is nearer. False splits (a real single-speaker cluster accidentally bimodal) only flip the high-distance subset to `'other'` — never the safe direction.
+- **Ambiguous cluster (20-50% pass):** no smoothing applied. Per-segment T_STRICT decision stands. Avoids cluster vote turning a half-Joe/half-TV cluster into all-Joe.
+- **Jarvis-TTS = Joe's cloned voice (distance 0.19):** strong-solo override fires (`< T_STRONG_SOLO=0.30`); `decision_reason='strong_solo'`; `is_user=True`. No special-case code path for the Jarvis speaker_id.
+- **First-person regex on TV dialogue with "I" tokens:** FP bonus is only -0.05 and only acts inside the borderline band (0.4473-0.70). Cannot rescue a control distance of 0.78. Hard reject at 0.85 is the ceiling.
+- **Apostrophe variants in FP regex:** covers both ASCII `'` and Unicode U+2019 `'` so `I'm` / `I've` are detected.
+- **voice-extras transient failure:** `dist=None` for affected sub-windows; they skip the cluster vote. If all sub-windows fail for a cluster, decision defaults to `'other'`. No crashes; pipeline degrades gracefully.
+- **Voiceprint version change mid-conversation:** `bank['version']` is captured at Stage 0 entry; full pipeline uses that snapshot. Re-attribution under a new version is Layer 6's job.
+- **Onboarding mode (transcribe.py L2117 forces `is_user=True` for non-Omi channel):** Layer 2 attribution is **bypassed** in this mode — onboarding answers are ground truth and feed the bank. `attribute_user` is not called for onboarding segments.
+- **Continual-sample contamination guard:** only segments with `decision_reason='strong_solo'` AND `distance_raw < 0.20` AND `n_sub_windows >= 2` are eligible to feed `continual_samples` (Layer 1 continual-learning gate). Excludes `cluster_vote_user`, `fp_prior_rescue`, and split-mode paths from contaminating the bank.
+
+### Expected impact
+
+Against the 2026-05-31 validation data:
+
+| Metric | Old pipeline (single threshold 0.45) | Layer 2 expected |
+|---|---|---|
+| Conv A Joe recall | 4 / 14 (28.6%) | **13-14 / 14 (≥93%)** — cluster vote rescues the bimodal-distant Joe; strong-solo catches augmented samples and Jarvis-TTS |
+| Conv B control rejection | (untested at old threshold) | **12 / 12 (100%)** at T_HARD_REJECT=0.85; **10-12 / 12 (83-100%)** at T_VOTE=0.70 cluster vote |
+| Phantom memory rate | high (anecdotal) | **<5%** (compound with Layer 4 first-person guardrails) |
+| Jarvis-TTS handling | mis-classified as non-user | **correctly is_user=True** with `strong_solo` provenance |
+| Deepgram cluster-merge bug | propagates to memories | **bimodal split detection** isolates the Joe subset per-segment |
+
+### Computational cost
+
+Per conversation (10-min average, ~120 segments at ~4s mean duration):
+
+- **Sub-window embeddings:** ~120 segments × 2 sub-windows avg = ~240 voice-extras calls. With concurrency=4 (existing stt-client semaphore) and ~150ms p50 per request → **~9s wall-clock embedding time in batch mode**.
+- **Real-time mode:** reuses live SPEAKER_ID embedding (one per cluster-flush every ~10s) plus 1-2 extra sub-window embeds per cluster finalize → **+20-30% over current voice-extras call volume**, well within the rtx6000 endpoint's headroom (~60 RPS ceiling).
+- **Bank lookup:** `cdist` against 146 × 192 numpy array — **~50µs per call**, negligible.
+- **Cluster vote + split detection + FP prior + final decision:** pure numpy + regex, sub-millisecond per cluster.
+- **Memory footprint:** per-process bank cache (~110 KB for 146 × 192 float32). Negligible.
+- **Bank match cache opportunity (Layer 6):** per-conversation embeddings can be cached so voiceprint-version bumps re-run only the match step, not the embed step. Not strictly Layer 2 but enabled by it.
 
 ### What this fixes
 
-| Failure mode | Result after Layer 2 |
-|--------------|---------------------|
-| Single-segment false positive on user match | Filtered (corroboration N=2 minimum) |
-| Deepgram cluster-merge → wrong segments tagged user | Split: only the actually-matching sub-windows stay user |
-| Fixed threshold inflating false positives | Replaced by per-user calibrated threshold from voiceprint bank |
+| Failure mode | Layer 2 mechanism that addresses it |
+|---|---|
+| Single-segment false positive | Cluster vote requires duration-weighted majority; single bad embedding can't flip a cluster |
+| Deepgram cluster-merge (Joe + TV fused) | Bimodal split detection routes each segment to its nearest mode |
+| Fixed threshold inflating false positives | Replaced by per-user calibrated threshold (`T_STRICT=0.5473`) + relaxed `T_VOTE=0.70` for cluster vote |
+| Jarvis-TTS treated as non-user (cloned voice paradox) | Strong-solo override accepts at distance < 0.30 |
+| Bimodal Joe distances (0.27 vs 0.65-0.74) on wearable audio | Cluster cohesion: distant-mode Joe segments rescued by sharing a `speaker_id` cluster with strong-match Joe sub-windows |
+| Unaccountable attribution | Every segment carries `attribution.{distance_raw, decision_reason, cluster_decision, voiceprint_version, algo_version}` — Layer 5 critic + Layer 6 re-diarize can replay and audit any decision |
 
 ---
 
