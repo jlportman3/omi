@@ -384,11 +384,13 @@ def attribute_user(
             final = True
             reason = 'cluster_split_lower_mode' if cluster_split else 'cluster_vote_user'
         elif (
-            adj is not None
-            and adj < t_strict
-            and fp_band_low <= (raw if raw is not None else 1.0) <= fp_band_high
-            and fp_present
+            adj is not None and raw is not None and raw < t_strict and fp_band_low <= raw <= fp_band_high and fp_present
         ):
+            # NOTE: gate is `raw < t_strict`, NOT `adj < t_strict`. The FP prior
+            # is a *confirmation* signal that widens by sign within the
+            # borderline band — it must not turn a raw-above-T_STRICT segment
+            # into a pass via fp_adjust alone. See "Validation findings v1.1"
+            # in the spec for the heist-conv false-positive bug this prevents.
             final, reason = True, 'fp_prior_rescue'
         else:
             final, reason = False, 'cluster_other'
