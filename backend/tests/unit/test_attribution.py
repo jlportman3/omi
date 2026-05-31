@@ -367,24 +367,36 @@ def test_hard_reject_above_085():
 def test_fp_prior_bonus():
     """Borderline seg with FP text → cluster='other' (minority) → adj rescues.
 
-    fp_prior_rescue only fires when cluster_decision is 'other'. Construct a
-    5-member cluster that votes minority/other (pass_ratio ≤ 0.20) but with
-    a gap small enough to NOT trigger bimodal split:
-      [0.58, 0.72, 0.72, 0.72, 0.72]  → gap 0.14 < 0.20, pass=1/5=0.20 → minority.
-    Bank calibrated_threshold=0.55 → borderline band = (0.45, 0.70).
-    The 0.58 seg with FP text gets adj=0.53 < 0.55 → fp_prior_rescue.
+    fp_prior_rescue requires BOTH cluster_decision='other' AND raw < T_STRICT.
+    The FP prior is a confirmation of an already-borderline-user signal; it
+    cannot flip a raw-above-T_STRICT segment into a pass via fp_adjust alone
+    (see "Validation findings v1.1" in the spec).
+
+    Construct a 6-member cluster that votes minority/other. K_MAX=5 caps the
+    sample by `(-duration, start_time)`. By giving the "other" segs a longer
+    duration (1.0s) than the rescue seg (0.8s), the rescue seg is EXCLUDED
+    from the K_MAX sample and the vote is 0/5 = 0.0 ≤ MINORITY → cluster='other'.
+    The rescue seg still has its own per-segment raw_dist computed in Stage 1
+    (it embeds independently in Stage 0), so Stage 4 can apply the FP-prior
+    rescue on its raw=0.54 < t_strict=0.55 in band, FP present.
+
+    Why not 5 same-duration segs? Because durations of 0.8 introduce
+    floating-point error in pass_ratio (1*0.8 / 5*0.8 = 0.20000000000000004
+    > MINORITY=0.20), which puts the cluster in the ambiguous band and
+    cluster_decision gets per-segment-flipped — yielding cluster='user' for
+    the target seg, masking the rescue path entirely.
     """
     rescue_seg = Segment(0.0, 0.8, 'cl', text='I am Joe')
-    _set_window_distance(0.0, 0.8, [0.58])
+    _set_window_distance(0.0, 0.8, [0.54])
     other_segs = []
-    for i in range(1, 5):
-        s = i * 1.0
-        seg = Segment(s, s + 0.8, 'cl')
+    for i in range(1, 6):  # 5 other segs at 1.0s each — all sampled before rescue (which is 0.8s)
+        s = i * 2.0
+        seg = Segment(s, s + 1.0, 'cl')
         other_segs.append(seg)
-        _set_window_distance(s, s + 0.8, [0.72])
+        _set_window_distance(s, s + 1.0, [0.73])
 
     bank = make_bank(calibrated_threshold=0.55)
-    pcm = _enough_pcm_for(10.0)
+    pcm = _enough_pcm_for(20.0)
     result = attribute_user(
         [rescue_seg] + other_segs, bank, pcm, sample_rate=SAMPLE_RATE, embed_fn=make_fake_embed_fn({})
     )
@@ -393,11 +405,56 @@ def test_fp_prior_bonus():
     rescued = result[0]
     assert rescued.attribution['first_person_present'] is True
     assert rescued.attribution['fp_adjust'] == pytest.approx(FP_PRIOR_BONUS)
-    assert rescued.attribution['distance_after_prior'] == pytest.approx(0.53)
+    assert rescued.attribution['distance_raw'] == pytest.approx(0.54, abs=1e-3)
+    assert rescued.attribution['distance_after_prior'] == pytest.approx(0.49, abs=1e-3)
     assert rescued.attribution['cluster_decision'] == 'other'  # cluster minority
     assert rescued.attribution['cluster_split_detected'] is False
     assert rescued.is_user is True
     assert rescued.attribution['decision_reason'] == 'fp_prior_rescue'
+
+
+def test_fp_prior_rescue_blocked_when_raw_above_t_strict():
+    """Regression: raw above T_STRICT must NOT be rescued even with FP text.
+
+    Reproduces the heist-conv false-positive: a segment with raw=0.595 sits
+    inside the FP borderline band (T_STRICT - 0.10, T_VOTE) = (0.4473, 0.70)
+    but ABOVE T_STRICT_DEFAULT=0.5473. With the FP_PRIOR_BONUS=-0.05 applied,
+    distance_after_prior = 0.545, which is below T_STRICT. The buggy gate
+    (`adj < t_strict`) would have rescued it; the correct gate (`raw <
+    t_strict`) must not. Final decision must be cluster_other, not
+    fp_prior_rescue — the FP prior can only confirm a sub-T_STRICT signal,
+    never flip a sub-vote/super-strict raw into a user pass.
+    """
+    target_seg = Segment(0.0, 0.8, 'cl', text="I don't want the phone.")
+    _set_window_distance(0.0, 0.8, [0.595])
+    other_segs = []
+    for i in range(1, 5):
+        s = i * 1.0
+        seg = Segment(s, s + 0.8, 'cl')
+        other_segs.append(seg)
+        _set_window_distance(s, s + 0.8, [0.72])
+
+    # Use default bank threshold (0.5473) so raw=0.595 is unambiguously above T_STRICT.
+    bank = make_bank()
+    pcm = _enough_pcm_for(10.0)
+    result = attribute_user(
+        [target_seg] + other_segs, bank, pcm, sample_rate=SAMPLE_RATE, embed_fn=make_fake_embed_fn({})
+    )
+
+    target = result[0]
+    # Setup sanity: the segment really does have FP text, sits in the borderline
+    # band, and adj alone would clear T_STRICT — that's the trap the bug fell into.
+    assert target.attribution['first_person_present'] is True
+    assert target.attribution['fp_adjust'] == pytest.approx(FP_PRIOR_BONUS)
+    assert target.attribution['distance_raw'] == pytest.approx(0.595)
+    assert target.attribution['distance_after_prior'] == pytest.approx(0.545)
+    assert target.attribution['distance_after_prior'] < T_STRICT_DEFAULT
+    assert target.attribution['distance_raw'] > T_STRICT_DEFAULT
+    assert target.attribution['cluster_decision'] == 'other'
+    assert target.attribution['cluster_split_detected'] is False
+    # The fix: raw > T_STRICT blocks the rescue regardless of fp_adjust.
+    assert target.is_user is False
+    assert target.attribution['decision_reason'] == 'cluster_other'
 
 
 def test_fp_prior_penalty():
@@ -579,17 +636,19 @@ def test_decision_reasons_exhaustive():
     assert len(split_segs) == 4
 
     # Now exercise fp_prior_rescue separately. Needs a minority-vote cluster
-    # so cluster_decision='other' (otherwise cluster_vote_user pre-empts).
+    # so cluster_decision='other' (otherwise cluster_vote_user pre-empts) AND
+    # raw < T_STRICT (the FP prior confirms, never flips — see v1.1 fix).
+    # See test_fp_prior_bonus for the same construction.
     target = Segment(0.0, 0.8, 'cl', text='I am Joe')
-    _set_window_distance(0.0, 0.8, [0.58])
+    _set_window_distance(0.0, 0.8, [0.54])
     others = []
-    for i in range(1, 5):
-        s = i * 1.0
-        o = Segment(s, s + 0.8, 'cl')
+    for i in range(1, 6):
+        s = i * 2.0
+        o = Segment(s, s + 1.0, 'cl')
         others.append(o)
-        _set_window_distance(s, s + 0.8, [0.72])
+        _set_window_distance(s, s + 1.0, [0.73])
     bank2 = make_bank(calibrated_threshold=0.55)
-    pcm2 = _enough_pcm_for(10.0)
+    pcm2 = _enough_pcm_for(20.0)
     r2 = attribute_user([target] + others, bank2, pcm2, sample_rate=SAMPLE_RATE, embed_fn=make_fake_embed_fn({}))
     assert r2[0].attribution['decision_reason'] == 'fp_prior_rescue'
 
