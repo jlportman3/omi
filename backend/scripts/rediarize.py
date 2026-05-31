@@ -23,8 +23,22 @@ Notes:
 
 import argparse
 import logging
+import os
+import pathlib
 import sys
 from typing import List, Optional
+
+# Anchor GOOGLE_APPLICATION_CREDENTIALS to the backend dir when it is a relative
+# path that does not resolve against the current working directory. This script
+# is commonly invoked from a worktree (e.g. .claude/worktrees/...) where the
+# cwd-relative path baked into backend/.env will not resolve, causing
+# google.auth.DefaultCredentialsError on the first google.cloud import below.
+creds_env = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+if creds_env and not os.path.isabs(creds_env) and not os.path.exists(creds_env):
+    backend_root = pathlib.Path(__file__).resolve().parent.parent
+    anchored = backend_root / creds_env
+    if anchored.exists():
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = str(anchored)
 
 from database import conversations as conversations_db
 from routers.sync import pcm_to_wav
