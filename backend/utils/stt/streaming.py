@@ -9,7 +9,9 @@ from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEve
 from deepgram.clients.live.v1 import LiveOptions
 
 from utils.byok import get_byok_key
+from utils.stt.realtime_provider import RealtimeApiStreamingProvider
 from utils.stt.safe_socket import KeepaliveConfig, SafeDeepgramSocket  # noqa: F401 — re-exported for backward compat
+from utils.stt.streaming_provider import STTStreamingProvider
 from utils.stt.vad_gate import GatedDeepgramSocket
 import logging
 
@@ -180,7 +182,7 @@ deepgram = DeepgramClient(os.getenv('DEEPGRAM_API_KEY'), deepgram_options)
 deepgram_beta = DeepgramClient(os.getenv('DEEPGRAM_API_KEY'), deepgram_cloud_options)
 
 
-async def process_audio_dg(
+async def _open_deepgram_session(
     stream_transcript,
     language: str,
     sample_rate: int,
@@ -190,14 +192,14 @@ async def process_audio_dg(
     vad_gate=None,
     is_active: Optional[Callable[[], bool]] = None,
 ):
-    """Create a Deepgram streaming connection.
+    """Build a Deepgram streaming session (SafeDeepgramSocket [+ optional VAD gate]).
 
     Args:
         vad_gate: Optional VADStreamingGate. If provided, returns a
             GatedDeepgramSocket that handles VAD gating internally and
             remaps timestamps in the stream_transcript callback.
     """
-    logger.info(f'process_audio_dg {language} {sample_rate} {channels}')
+    logger.info(f'_open_deepgram_session {language} {sample_rate} {channels}')
 
     # If gate provided, wrap stream_transcript to remap DG timestamps
     if vad_gate is not None:
@@ -275,6 +277,104 @@ async def process_audio_dg(
     if vad_gate is not None:
         return GatedDeepgramSocket(safe_conn, gate=vad_gate)
     return safe_conn
+
+
+class DeepgramStreamingProvider(STTStreamingProvider):
+    """Provider wrapper around the existing Deepgram streaming path.
+
+    The session object returned by ``open_session`` is a ``SafeDeepgramSocket``
+    or a ``GatedDeepgramSocket`` (both already expose ``send``/``finalize``/
+    ``finish``), preserving the contract that ``routers/transcribe.py`` has
+    consumed since the Deepgram-only era.
+    """
+
+    name = "deepgram"
+
+    async def open_session(
+        self,
+        stream_transcript,
+        language: str,
+        sample_rate: int,
+        channels: int,
+        model: str = 'nova-3',
+        keywords: Optional[List[str]] = None,
+        vad_gate=None,
+        is_active: Optional[Callable[[], bool]] = None,
+        **_ignored,
+    ):
+        return await _open_deepgram_session(
+            stream_transcript=stream_transcript,
+            language=language,
+            sample_rate=sample_rate,
+            channels=channels,
+            model=model,
+            keywords=keywords or [],
+            vad_gate=vad_gate,
+            is_active=is_active,
+        )
+
+
+def _select_streaming_provider() -> STTStreamingProvider:
+    """Pick the live-transcription provider based on STT_STREAMING_PROVIDER.
+
+    Recognized values (case-insensitive):
+      deepgram (default)               → DeepgramStreamingProvider
+      realtime-local | realtime |      → RealtimeApiStreamingProvider
+      speaches | whisper-local
+    Unknown values fall through to Deepgram so a typo never silently breaks
+    transcription for the whole fleet.
+    """
+    provider_name = os.getenv('STT_STREAMING_PROVIDER', 'deepgram').strip().lower()
+    if provider_name in ('realtime-local', 'realtime', 'speaches', 'whisper-local'):
+        logger.info('STT streaming provider: realtime-local (OpenAI Realtime API)')
+        return RealtimeApiStreamingProvider()
+    if provider_name and provider_name != 'deepgram':
+        logger.warning('Unknown STT_STREAMING_PROVIDER=%r, falling back to deepgram', provider_name)
+    logger.info('STT streaming provider: deepgram')
+    return DeepgramStreamingProvider()
+
+
+async def process_audio_dg(
+    stream_transcript,
+    language: str,
+    sample_rate: int,
+    channels: int,
+    model: str = 'nova-3',
+    keywords: List[str] = [],
+    vad_gate=None,
+    is_active: Optional[Callable[[], bool]] = None,
+):
+    """Open a live streaming-transcription session.
+
+    Historically this opened a Deepgram socket directly. It now dispatches
+    on the ``STT_STREAMING_PROVIDER`` env var:
+
+      - ``deepgram`` (default) — preserves the original behavior bit-for-bit.
+      - ``realtime-local`` — connects to a self-hosted OpenAI-Realtime-compatible
+        endpoint (e.g. speaches/LiteLLM at ``ws://10.0.60.48:4000/v1/realtime``).
+
+    The function signature is intentionally unchanged so the sole caller
+    (``routers/transcribe.py``) keeps working without modification through
+    Phase A. Operators flip the env var in Phase B to switch a deployment.
+
+    Args:
+        vad_gate: Optional VADStreamingGate. If provided with the Deepgram
+            provider, returns a GatedDeepgramSocket that handles VAD gating
+            internally and remaps timestamps in the stream_transcript
+            callback. The realtime-local provider also honors the gate's
+            pre-filter on send.
+    """
+    provider = _select_streaming_provider()
+    return await provider.open_session(
+        stream_transcript=stream_transcript,
+        language=language,
+        sample_rate=sample_rate,
+        channels=channels,
+        model=model,
+        keywords=keywords,
+        vad_gate=vad_gate,
+        is_active=is_active,
+    )
 
 
 # Calculate backoff with jitter
