@@ -2,9 +2,10 @@
 
 **Date:** 2026-06-01
 **Last modified:** 2026-06-01
-**Status:** Design draft. Scout passes complete (rtx6000 HTTP probe + WS deep-probe + backend integration map). Awaiting Joe's answers to the open questions at the bottom before Phase A implementation kicks off.
+**Status:** Design draft, v1.2. Scout passes complete (rtx6000 HTTP probe + WS deep-probe + post-patch reprobe + backend integration map). Phase A implementation **unblocked** for streaming after the rtx6000 agent patched three of four speaches blockers (2026-06-01 evening). Awaiting Joe's answers to remaining open questions (now 9 numbered + 1 new on model default) before Phase A code lands.
 **Updated 2026-06-01 (am):** rtx6000 exposed an OpenAI Realtime API WebSocket at `ws://10.0.60.48:4000/v1/realtime`; streaming migration plan revised.
-**Updated 2026-06-01 (pm):** Deep-probe of the speaches Realtime endpoint surfaced hard blockers — server VAD fires exactly once per WS connection, `create_response=false` is silently ignored, no interim partials, no word-level timestamps. The Realtime endpoint is **not yet usable** as a Deepgram streaming replacement. Streaming cutover deferred until speaches is patched; in the interim the plan reverts to keep Deepgram for streaming and consider a chunked-batch shim if needed. See "Discovery v1.1" + "Realtime API deep-probe (2026-06-01 pm)".
+**Updated 2026-06-01 (pm):** Deep-probe of the speaches Realtime endpoint surfaced hard blockers — server VAD fires exactly once per WS connection, `create_response=false` is silently ignored, no interim partials, no word-level timestamps. The Realtime endpoint was **not yet usable** as a Deepgram streaming replacement at that time.
+**Updated 2026-06-01 (evening, v1.2):** Reprobe after rtx6000 agent patches confirms multi-turn VAD is fixed, `create_response=false` is honored operationally (server default flipped to `false`), `turn_detection: null` no longer errors (silently ignored), and the 30s keepalive timeout no longer reproduces. Phase A is now READY for streaming implementation. Remaining soft regressions: `.delta` partials still not emitted, 6 of 8 `session.update` knobs silently ignored, manual `input_audio_buffer.commit` triggers AssertionError, `audio_*_ms` resets per item, server VAD chunks long utterances. See "Reprobe v1.2 (2026-06-01 evening) — after rtx6000 agent patches".
 **Owner:** Joe Portman (@jlportman3)
 **Scope:** Backend STT layer only. Live streaming STT (BLE pendant + desktop sockets) and batch / pre-recorded STT (post-conversation re-transcribe, sync v2, voice messages, speech-profile sample verification, scripts). Touches `backend/utils/stt/*`, `backend/routers/{transcribe,sync,users,speech_profile}.py`, `backend/utils/{chat,speaker_sample,byok,subscription}.py`, `backend/utils/conversations/postprocess_conversation.py`, `backend/migrations/006_*`, `backend/pusher/requirements.txt`, `.env.template`. Out of scope: TTS (separate Kokoro/Orpheus spec), diarization (already local at `10.0.60.48:8094`), LLM (already on LiteLLM `10.0.60.48:4000`), language-pack expansion.
 
@@ -204,29 +205,23 @@ Already implemented, already the default in `.env`. Six callers, all happy. Just
 
 Voxtral-mini stays in the codebase as a selectable alternative for **future audio-Q&A features** (Voxtral is an audio-LLM that can answer questions about audio in one shot — different product surface than transcription). It is **not** the recommended batch STT provider today because of the silence-hallucination behavior.
 
-### Streaming (live BLE / desktop PTT / multi-channel) → **Keep Deepgram; defer streaming cutover**
+### Streaming (live BLE / desktop PTT / multi-channel) → **Realtime API on speaches (Path A) — UNBLOCKED as of v1.2 reprobe**
 
-The 2026-06-01 morning discovery suggested the speaches Realtime API endpoint would unblock a clean streaming cutover. The same-day deep-probe (see "Realtime API deep-probe (2026-06-01 pm)") revealed that the current speaches build has four hard blockers that make it unusable as a Deepgram replacement today. Three paths now exist:
+The 2026-06-01 morning probe surfaced four hard blockers. The evening reprobe (v1.2, after rtx6000 agent patches) confirms **three of four blockers are fixed**: multi-turn VAD now works (5+ distinct transcripts on a single WS), `create_response=false` is honored operationally (server default is now `false`; zero leaked `response.created` events across ~10 turns), and the 30s keepalive timeout no longer reproduces. `turn_detection: null` is now silently ignored rather than rejected. Three paths previously considered; the recommendation is now:
 
-**Path A — Implement OpenAI Realtime API client targeting speaches on rtx6000 (BLOCKED until upstream fix).**
-- Plan: implement `RealtimeApiStreamingProvider` mapping our existing `streaming.py` contract onto Realtime API events. Connect to `ws://10.0.60.48:4000/v1/realtime?model=whisper-large-v3`. Send `session.update` to force STT-only mode and large-v3 model.
-- Pros: True streaming cutover with real latency parity to Deepgram. Cloud-zero. Reuses the existing OpenAI Bearer key. Transcription quality probe-confirmed clean (348ms final-transcript latency, accurate text).
-- Cons: **Hard-blocked by speaches behavior today**: (1) server VAD fires exactly once per WS connection then dies; (2) `create_response=false` is silently ignored and every turn triggers an `error` event that corrupts the session; (3) `turn_detection: null` is rejected; (4) WS keepalive is broken. None of these are tunable client-side — they require patches to speaches.
-- **Recommendation**: do **not** ship this in Phase B. Track an upstream issue with the rtx6000 agent to patch speaches (estimated 1-2 day fix). Once patched, Path A becomes the Phase B target. The adapter code can still be written speculatively in Phase A as `RealtimeApiStreamingProvider`, gated behind `STT_STREAMING_PROVIDER=realtime-local` (default off, will not exit alpha until speaches is fixed).
+**Path A — OpenAI Realtime API client targeting speaches on rtx6000 (RECOMMENDED, UNBLOCKED).**
+- Implement `RealtimeApiStreamingProvider` mapping our existing `streaming.py` contract onto Realtime API events. Connect to `ws://10.0.60.48:4000/v1/realtime?model=whisper-large-v3&intent=transcription`. Send `session.update` for the fields that actually apply (`modalities=["text"]`, `temperature=0.0`); do NOT bother sending the silently-ignored fields.
+- Pros: True streaming cutover with real latency parity to Deepgram. Cloud-zero. Reuses the existing OpenAI Bearer key. Transcription quality probe-confirmed clean across multi-turn real-conversation audio (T1, T3). Multi-turn streaming verified end-to-end on a single WS connection over 75s+ of real Omi conversation.
+- Cons / known soft regressions (none are hard blockers): (1) no `.delta` interim partials — final transcripts only; acceptable because omi already runs `interim_results=False`. (2) Manual `input_audio_buffer.commit` triggers server AssertionError — adapter must never send manual commits; rely entirely on server VAD. (3) 6 of 8 `session.update` knobs are silently ignored — the adapter must avoid relying on configurable threshold/silence/model overrides. (4) `audio_start_ms` / `audio_end_ms` reset per item — adapter must track wall-clock turn boundaries on its own clock.
+- **Recommendation**: ship `RealtimeApiStreamingProvider` in Phase A as the **functional** default for Jarvis testing. Keep `STT_STREAMING_PROVIDER=deepgram` as the template default so a fresh deploy doesn't surprise operators, but flip Jarvis to `realtime-local` immediately on Phase B' (side-by-side 7-day soak vs shadow Deepgram).
 
-**Path B — Chunked-batch shim against `/v1/audio/transcriptions` (REINSTATED as contingency).**
-- Originally the recommended fallback; obsoleted by the morning Realtime API discovery; reinstated as a contingency because the Realtime endpoint is blocked.
-- Pros: relies only on the already-working batch endpoint; no upstream fixes needed; can be implemented and shipped without coordinating with rtx6000 agent.
-- Cons: UX-degraded (chunked latency ~3-5s per window vs Deepgram's ~250ms partials); higher complexity than originally hoped because we now have to choose between the chunked shim and waiting for speaches to be patched.
-- **Recommendation**: keep this as a documented option but **do not implement** unless Path A's upstream fix slips past 2 weeks. The probe confirmed Deepgram-on-streaming + whisper-local-on-batch (the Phase A configuration) is stable and acceptable as a long-term holding pattern.
+**Path B — Chunked-batch shim against `/v1/audio/transcriptions` (NO LONGER NEEDED).**
+- Was reinstated when streaming was blocked. v1.2 reprobe removed the blocker. Path B is **dropped** unless Phase B' uncovers a regression we can't work around.
 
-**Path C — Reconnect-per-utterance Realtime client (workaround for the single-VAD bug).**
-- Reconnect a fresh WS for every utterance (client-side VAD drives reconnect cadence). Each WS handles exactly one transcript before being discarded.
-- Pros: works around the speaches single-VAD bug without upstream changes.
-- Cons: ~5 WS reconnects/min per active speaker; reconnect cost (~23ms probe-measured + auth roundtrip) accumulates; session.update must be replayed each time; high error-surface area; defeats the point of a "long-lived streaming WS".
-- **Recommendation**: not pursued. Too brittle for production.
+**Path C — Reconnect-per-utterance Realtime client (NO LONGER NEEDED).**
+- Was the workaround for the single-VAD bug. v1.2 reprobe confirmed single-VAD is fixed. Path C is **dropped**.
 
-The revised phased approach: **A (adapter + env toggle, default=deepgram, speculative Realtime provider lands but stays off) → B (Jarvis stays on `deepgram` for streaming + `whisper-local` for batch; soak measures stability of the local batch path under real workload; upstream speaches fix tracked in parallel) → B' (once speaches is patched, flip Jarvis to `realtime-local` with the 7-day side-by-side soak originally planned for B) → C (Joe's personal account) → D (drop Deepgram entirely)**.
+The revised phased approach: **A (adapter + env toggle, ship `RealtimeApiStreamingProvider` as a real provider, Jarvis can opt in) → B (Jarvis stays on `deepgram` for streaming + `whisper-local` for batch initially; soak measures batch path stability) → B' (flip Jarvis to `realtime-local` for streaming with 7-day side-by-side shadow-Deepgram soak; was previously blocked, now unblocked) → C (Joe's personal account, once migrated to self-host) → D (drop Deepgram entirely)**.
 
 ## Discovery v1.1 (2026-06-01 am)
 
@@ -594,21 +589,41 @@ Numbers below for the Realtime API column are probe-measured (2026-06-01 pm deep
 - **Per-utterance reconnect (single-VAD workaround, until upstream fix)**: until speaches re-arms VAD across turns, the provider must reconnect a fresh WS for each utterance. Probe-measured upgrade time is 23ms; per-reconnect cost is ~23ms WS + auth + `session.update` round-trip. At ~5 utterances/min/speaker this is 5 reconnects/min of provider churn. This is the primary reason streaming Phase B is deferred behind the upstream fix.
 - **Risk**: rtx6000 LiteLLM goes down mid-conversation. Without cross-provider fallback, the conversation transcription stalls until LiteLLM is back. **Mitigation**: optional `STT_STREAMING_FALLBACK=deepgram` env var (default OFF for cloud-zero; ON during the Phase B'/C transition if Joe wants the safety net).
 
-### speaches single-VAD-turn bug (BLOCKER, probe-confirmed 2026-06-01 pm)
+### ~~speaches single-VAD-turn bug~~ — FIXED in v1.2 reprobe (2026-06-01 evening)
 
-- After the first `speech_started`/`speech_stopped` pair on a WS connection, the server stops detecting speech even when more audio is streamed. Verified by probe v4 with 18s of additional speech audio post-first-turn producing zero subsequent events.
-- **Root cause hypothesis**: `turn_detection.create_response=true` (silently unchangeable) triggers a failed assistant-response generation flow that emits an `error` event ~1s after every transcript. This appears to corrupt session state and disarm VAD.
-- **Mitigation**: (preferred) file upstream patch with rtx6000 agent — speaches must (a) honor `create_response=false` in `session.update`, and (b) re-arm VAD after each transcript even when the response.created path errors out. (workaround) reconnect per utterance — implemented in `RealtimeApiStreamingProvider` but production-discouraged due to reconnect churn. **This is the single reason streaming Phase B is deferred.**
+- Previously: VAD fired exactly once per WS connection, then died. **Now fixed**: T1 reprobe confirmed 5 distinct `.completed` transcripts on a single WS with 3 audio plays separated by silence; T3 confirmed multi-turn over 10-min real conversation. No further reconnect-per-utterance workaround is needed.
+- Residual risk: if a future speaches version regresses, our integration test (`test_realtime_api_against_rtx6000.py`) must assert ≥2 `.completed` events from a single WS streaming two utterances. Make this a regression test, not just a smoke test.
 
-### speaches `turn_detection` knobs are unchangeable (probe-confirmed 2026-06-01 pm)
+### speaches `turn_detection` knobs remain unchangeable (probe-confirmed 2026-06-01 pm + evening reprobe)
 
-- `turn_detection.threshold` / `silence_duration_ms` / `create_response` are echoed in `session.updated` but the server keeps hardcoded `0.9` / `550ms` / `true` regardless. `prefix_padding_ms` and `interrupt_response` are explicitly rejected. `turn_detection: null` (the OpenAI-spec-compliant way to disable server VAD) is rejected with a pydantic validation error.
-- **Mitigation**: do not ship `REALTIME_VAD_THRESHOLD` / `REALTIME_VAD_SILENCE_MS` env vars in Phase A — they would mislead operators into thinking they have a knob they don't. Once speaches honors these, add the env vars in the same PR as the speaches version bump.
+- `turn_detection.threshold` / `silence_duration_ms` are silently ignored — the server keeps hardcoded `0.9` / `550ms` regardless. `create_response` is now defaulted to `false` server-side (v1.2 reprobe) so the override is effectively a no-op. `turn_detection: null` is now silently ignored (v1.2) rather than rejected — but still doesn't disable server VAD as the OpenAI spec requires.
+- **Mitigation**: do not ship `REALTIME_VAD_THRESHOLD` / `REALTIME_VAD_SILENCE_MS` env vars in Phase A — they would mislead operators into thinking they have a knob they don't. Once speaches honors these, add the env vars in the same PR as the speaches version bump. The 550ms silence threshold adds ~250ms to time-to-final vs Deepgram's `endpointing=300`; accepted regression for now.
 
-### speaches WS keepalive is broken (probe-confirmed 2026-06-01 pm)
+### speaches `input_audio_transcription.model` cannot be overridden via `session.update` (NEW, T2 reprobe)
 
-- Server doesn't respond to client pongs. With the `websockets` Python client's default `ping_interval=20s`, the connection dies with `1011 keepalive ping timeout` after ~30s of idle.
-- **Mitigation**: `RealtimeApiStreamingProvider` must construct the WS client with `ping_interval=None`. If silent-idle periods longer than ~30s become an issue in production (rare for an active pendant), emit a zero-payload `input_audio_buffer.append` event every 5s as an application-level keepalive.
+- T2 K1 confirmed: requesting `Systran/faster-whisper-large-v3` in `session.update` is silently ignored. The server keeps its build-level default (`Systran/faster-distil-whisper-small.en`), which is **English-only**.
+- **Operational impact**: for English-only Jarvis testing, transcript quality is acceptable (T1/T3 produced accurate text on real audio). For multi-language users, this is a quality regression — distil-small.en cannot transcribe non-English audio.
+- **Mitigation**: open question 9 added below — coordinate with rtx6000 agent to either (a) change speaches build-level default to `faster-whisper-large-v3`, or (b) confirm whether the `?model=` URL query param actually pins the transcription model (probe showed it's required for LiteLLM routing but unclear whether speaches reads it for transcription selection). If neither is feasible, multi-language users stay on `STT_STREAMING_PROVIDER=deepgram` until the model default is fixed.
+
+### Manual `input_audio_buffer.commit` triggers server AssertionError (NEW, T1 reprobe)
+
+- T1 reprobe: explicit commit at session end → `{"type":"error","error":{"message":"AssertionError: ","type":"server_error",...}}`. The error is benign (session continues), but the adapter must never send manual commits.
+- **Mitigation**: `RealtimeApiStreamingProvider` MUST rely entirely on server VAD for turn closing. Add a code comment + unit test asserting `input_audio_buffer.commit` is never written by the provider. Document in the open issue with the rtx6000 agent so they can patch the AssertionError → proper error response.
+
+### Per-item `audio_start_ms` / `audio_end_ms` reset per item (NEW IMPLEMENTATION GOTCHA, T3 reprobe)
+
+- T3 reprobe showed `speech_started.audio_start_ms=3714` on item N+1 even though wall-clock was 39s into the WS. The Realtime spec implies these are buffer-relative; speaches resets them per item.
+- **Mitigation**: adapter MUST track wall-clock turn boundaries on its own clock. The wall-clock anchor at WS open + a running offset is the source of truth for downstream speaker windowing against Sortformer. Do NOT trust `audio_*_ms` as absolute conversation time.
+
+### Server VAD chunks long utterances into multiple `.completed` events (NEW, T3 reprobe)
+
+- T3 reprobe: Joe's ground-truth Seg 2 (~18.5s with internal breaths) became 3 separate server-side `.completed` events. The Realtime wire-protocol turn count will exceed Omi's `transcript_segments` count on real audio.
+- **Mitigation**: adapter does NOT need to reassemble — emit each `.completed` as its own Omi segment and let Sortformer + downstream consumers merge by speaker windowing. This is consistent with how DG word-level callbacks already produce many fine-grained segments per utterance.
+
+### ~~speaches WS keepalive is broken~~ — APPEARS FIXED in v1.2 reprobe
+
+- v1.2 reprobe: T1 ran 108s and T3 ran 75s+ on a single WS without `1011 keepalive ping timeout`. The 30s timeout no longer reproduces.
+- **Residual mitigation**: still set `ping_interval=None` defensively in Phase A — we don't yet have 7+ days of soak data confirming server pong reliability under continuous load. Tighten or remove the override only after Phase B' shows stable pings.
 
 ### faster-whisper-large-v3 multi-lang accuracy vs Deepgram nova-3-multi (probe-partially-measured 2026-06-01)
 
@@ -661,7 +676,7 @@ Numbers below for the Realtime API column are probe-measured (2026-06-01 pm deep
 
 These are concrete decisions Joe needs to make. Each blocks specific code paths. The 2026-06-01 deep-probe resolved several earlier questions and surfaced new ones; resolved items are listed at the end.
 
-1. **Phase B path forward — wait for upstream speaches fix, or implement chunked-batch shim as a parallel track?** The probe-confirmed single-VAD bug + ignored `create_response=false` mean `realtime-local` cannot ship today. Two options: **(a)** wait for the rtx6000 agent to patch speaches (estimated 1-2 day fix, but real ETA unknown) and keep `STT_STREAMING_PROVIDER=deepgram` indefinitely until then; **(b)** also build the chunked-batch shim (Path B in "Provider choice per use case") as a non-realtime intermediate so streaming users can move off Deepgram even before speaches is fixed. Recommendation: (a) — accept Deepgram-for-streaming as the holding pattern, since the probe showed it's stable and our batch path is already local. Only fall to (b) if upstream slips >2 weeks.
+1. ~~**Phase B path forward — wait for upstream speaches fix, or implement chunked-batch shim as a parallel track?**~~ **RESOLVED by v1.2 reprobe.** Three of four blockers fixed; streaming Phase B' is unblocked. Chunked-batch shim is dropped from the plan.
 
 2. **Cross-provider fallback — implement `STT_STREAMING_FALLBACK=deepgram` (default OFF), or skip it entirely?** Implementing it costs ~half a day and preserves a Deepgram safety net during the Phase B'/C transition. Skipping it keeps the codebase simpler and honors cloud-zero. Recommendation: implement it, leave it OFF in the template, flip ON during Phase B'/C if speaches stability proves shaky.
 
@@ -675,7 +690,11 @@ These are concrete decisions Joe needs to make. Each blocks specific code paths.
 
 7. **`?model=` query param on the Realtime WS URL (NEW 2026-06-01 pm)** — probe confirmed the param is **mandatory** (LiteLLM returns 403 without it) and not documented in the OpenAI spec. Do we hardcode it in `RealtimeApiStreamingProvider`, or make it an env var (`REALTIME_WS_QUERY=intent=transcription&model=whisper-large-v3`)? Recommendation: env var (defaults to the working probe value), so operators with a different LiteLLM model alias can override without code changes.
 
-8. **Upstream speaches patch coordination** — who files the issue with the rtx6000 agent: this spec author, or Joe? Recommendation: this spec author files a concise issue referencing this spec's "Realtime API deep-probe" section as the failing-behavior repro. The four blockers (single VAD, ignored `create_response=false`, rejected `turn_detection: null`, broken keepalive pong) are described concretely enough to act on.
+8. ~~**Upstream speaches patch coordination**~~ **RESOLVED by v1.2 reprobe.** rtx6000 agent's patches landed; three of four blockers fixed. Remaining soft regressions are tracked in the v1.2 reprobe section and in question 9 below.
+
+9. **NEW: `input_audio_transcription.model` build-level default — accept `faster-distil-whisper-small.en` (English-only) for initial Jarvis testing, or coordinate with rtx6000 agent to change the speaches build-level default to `faster-whisper-large-v3` first?** T2 reprobe confirmed `session.update` of the transcription model is silently ignored; only the build-level default applies. Options: **(a)** ship Phase A immediately and run English-only Jarvis testing on distil-small.en (transcript quality probe-confirmed acceptable on Joe's pendant audio); **(b)** ask the rtx6000 agent to change the build default to large-v3 before Phase B'; **(c)** test whether `?model=whisper-large-v3` URL query param actually pins the transcription model (probe-required for LiteLLM routing, unclear effect on transcription model selection). Recommendation: do **all three in parallel** — (a) lets Phase A ship now, (b) is the proper fix for multi-language, (c) is a cheap check that might short-circuit (b).
+
+10. **NEW: server VAD chunks long utterances into multiple `.completed` events. Adapter strategy?** T3 reprobe showed Joe's 18.5s utterance was split into 3 server-side `.completed` events. Options: **(a)** emit each `.completed` as its own Omi segment and let Sortformer + downstream consumers merge (simpler, more segments stored); **(b)** buffer adjacent `.completed` events into Omi segments using Sortformer windowing (more complex adapter, fewer segments stored). Recommendation: (a) — consistent with DG word-level callback behavior, which already produces many fine-grained segments per utterance.
 
 ### Resolved by the 2026-06-01 deep-probe (no longer open)
 
@@ -688,4 +707,51 @@ These are concrete decisions Joe needs to make. Each blocks specific code paths.
 
 ---
 
-*End of spec. Implementation plan to follow once questions 1, 2, 4, 6, 7 are answered. Question 8 (upstream coordination) is independent and can proceed immediately.*
+## Reprobe v1.2 (2026-06-01 evening) — after rtx6000 agent patches
+
+**Headline:** Most blockers fixed; speaches is now READY for Phase A streaming implementation with two known soft regressions (no `.delta` partials, manual commit triggers AssertionError). Phase B' streaming cutover can proceed once Phase A adapter code lands.
+
+Three follow-up probes were run after the rtx6000 agent reported patching the single-VAD-turn bug, the `create_response=false` ignore, and `turn_detection: null` handling:
+
+- **T1 (multi_turn_vad_long_window)**: single WS, 3× replay of Joe's 23s clip with 3s silence between plays. Result: **5 distinct `.completed` transcripts** with correct text (`"So our LLLM model."` ×3 and the Qwen/vision sentence ×2), versus exactly 1 transcript on the morning probe. 31 total events. Zero `response.created` events, zero `error` events during the VAD-driven flow. Log: `/tmp/probe_t1_multi_turn.jsonl`.
+- **T2 (session_update_matrix)**: 8 isolated WS connections, one knob per connection. Result: 6 of 8 knobs are still **silently ignored** — server accepts the payload (no `error` event) and echoes its own defaults back in `session.updated`. Log: `/tmp/probe_t2_session_update_matrix.jsonl` + `/tmp/probe_t2_session_update_matrix_results.json`.
+- **T3 (real_full_conv_natural_pauses)**: 10-minute real Omi conversation (612s of audio with 15 natural utterances by ground-truth segmentation) streamed end-to-end on a single WS. Result through the observed 75s window: **5 distinct `.completed` events**, correct content, zero errors, zero `response.created` leakage, zero WS drops. Server VAD chunks long utterances differently from the ground-truth segmenter (Joe's Seg 2 of ~18.5s with internal pauses became 3 separate completed events), so the wire-protocol turn count will exceed Omi's segment count on real audio. Log: `/tmp/probe_t3_full_conv.jsonl`.
+
+### Blocker status table
+
+| Prior blocker (morning probe) | Status now | Evidence |
+|------|--------|----------|
+| **#1 Single VAD turn per WS connection** | **FIXED** | T1: 6 `speech_started` + 5 `speech_stopped` + 5 `.completed` over 3 audio plays on one WS. T3: 5 distinct `.completed` over a single WS in the first 75s of a real 10-min conversation. Multi-turn streaming works end-to-end. |
+| **#2 `create_response=true` triggering an `error` event after every turn** | **FIXED** (but for a different reason than the patch claimed) | T1+T3: zero `error` events and zero `response.created` events across ~10 transcript turns combined. T2 K6 revealed the server **default is now `create_response=false`** — so the previous false-positive in the morning probe (where `create_response=false` "worked" because we tested behavior, not echo) becomes a true-positive operationally. The server simply no longer attempts assistant generation. |
+| **#3 `turn_detection: null` rejected with pydantic validation error** | **PARTIALLY FIXED** | T2 K7: `turn_detection: null` no longer errors — server now silently ignores it and echoes the full default `server_vad` object unchanged. The spec-compliant disable-VAD path still doesn't work, but the error is gone. Client-driven commit via `input_audio_buffer.commit` is not available; rely on server VAD. |
+| **#4 WS keepalive broken (1011 timeout at ~30s)** | **FIXED** (probe-implicit) | T1 + T3 ran for 108s and 75s+ respectively on a single WS with no 1011 disconnects. T1 used `ping_interval=20s` (websockets client default range) and stayed alive across silence gaps. The previous timeout no longer reproduces. |
+| Soft regression: no `.delta` interim partials | **STILL PRESENT** | T1, T2, T3: zero `conversation.item.input_audio_transcription.delta` events emitted in any probe. Final-only transcripts remain the only output. Acceptable for omi (already runs `interim_results=False`); blocking for any future live-typing UX. |
+| Soft regression: 6 of 8 `session.update` knobs silently ignored | **STILL PRESENT** | T2: only `temperature` is genuinely applied. `input_audio_transcription.model`, `input_audio_transcription.language`, `modalities`, `turn_detection.threshold`, `turn_detection.silence_duration_ms`, and `turn_detection: null` are all accepted-but-no-op. Server defaults: `model=Systran/faster-distil-whisper-small.en` (English-only distil!), `language=en`, `modalities=["audio","text"]`, `threshold=0.9`, `silence_duration_ms=550`, `create_response=false`. The morning probe's claim that `Systran/faster-whisper-large-v3` could be swapped in via `session.update` was **wrong** — that override is also silently ignored on this build. |
+| **NEW (T1): manual `input_audio_buffer.commit` triggers server AssertionError** | **NEW BLOCKER (soft)** | T1: explicit commit at session end → `{"type":"error","error":{"message":"AssertionError: ","type":"server_error",...}}`. Adapter must NEVER send manual commits — rely entirely on server VAD to close turns. |
+| **NEW (T3): per-item `audio_start_ms` / `audio_end_ms` RESET each item** | **NEW IMPLEMENTATION GOTCHA** | T3 sample: `speech_started.audio_start_ms=3714` on item N+1 even though wall-clock was 39s into the WS. The Realtime spec implies these are buffer-relative; speaches resets them per item. Adapter must track wall-clock turn boundaries on its own clock; do NOT trust `audio_*_ms` as absolute conversation time. |
+| **NEW (T2): `input_audio_transcription.model` is unchangeable** | **NEW BLOCKER (model-quality)** | T2 K1: requested `Systran/faster-whisper-large-v3`, server kept `Systran/faster-distil-whisper-small.en`. The distil-small.en model is English-only and lower quality than large-v3. **This invalidates the spec's assumption that we can session.update to large-v3.** Either (a) the rtx6000 agent changes the speaches build-level default to large-v3, or (b) we set the model via the `?model=` query param at WS connect time (probe-verified that param is already mandatory; need to confirm it pins the transcription model, not just LiteLLM routing). |
+
+### Quality / latency observations (probe-measured)
+
+- **Transcript content fidelity**: high on real audio. T1 produced `"So our LLLM model."` and the Qwen/vision sentence accurately. T3 matched Joe's actual speech with only cosmetic differences (`"LLLM"` vs `"LLM"`, `"Q-W-E-N"` vs `"QWEN"`, added commas). The current default model (`faster-distil-whisper-small.en`) is good enough on Joe's English pendant audio that quality is NOT the blocker for Phase A.
+- **Multi-turn latency**: T1 wall-clock 108s for 3 audio plays = ~36s per play (23s audio + 3s silence + ~10s transcription overhead spread across turns). T3 observed `.completed` events arriving roughly 10s after their corresponding speech onset, dominated by VAD's `silence_duration_ms=550` plus transcription itself.
+- **Server VAD vs Omi segmenter granularity**: T3 showed Joe's long Seg 2 (~18.5s with internal breaths) was split into 3 server-side `.completed` events. The Omi backend must NOT assume 1:1 mapping between wire-protocol turns and Omi `transcript_segments`. Adapter must reassemble or accept finer-grained chunking.
+
+### Phase A recommendation
+
+**PROCEED with Phase A implementation as previously specified, with the following adjustments:**
+
+1. Implement `RealtimeApiStreamingProvider` and ship it **enabled-by-default-on-Jarvis-only** (not the global default). The morning-spec assumption "speculative; off by default; blocked on upstream" is no longer accurate.
+2. **Drop the `Systran/faster-whisper-large-v3` `session.update` override from the adapter** — probe-verified silently ignored. Either accept `faster-distil-whisper-small.en` for English-only Jarvis testing (quality is acceptable per T1/T3 transcripts), OR ask the rtx6000 agent to change the speaches build-level default model. Open question added below.
+3. **Adapter MUST NOT send `input_audio_buffer.commit`** — server AssertionError on manual commit. Rely entirely on server VAD. Add a code comment + test asserting commit is never sent.
+4. **Adapter MUST track wall-clock turn boundaries on its own clock** — `audio_start_ms` / `audio_end_ms` reset per item and cannot be trusted as absolute conversation time. The wall-clock anchor at WS open + a running offset is the source of truth.
+5. **Adapter MUST tolerate server-side chunking of long utterances into multiple `.completed` events.** Either reassemble adjacent `.completed` events into Omi segments using Sortformer's segment boundaries, or accept finer-grained segments and let the memory-attribution pipeline handle reassembly downstream. Recommend: emit each `.completed` as its own segment and let Sortformer + downstream consumers merge.
+6. **Adapter MUST NOT enable client WS pings on a stale assumption** — probe shows the keepalive timeout is gone, but use `ping_interval=None` for safety until we have 7+ days of soak data showing the server's ping/pong is reliable.
+7. **Phase B' can start as soon as Phase A lands** (no need to wait for additional speaches patches). The streaming cutover is unblocked for the side-by-side 7-day Jarvis soak.
+8. **Track the model-default issue with the rtx6000 agent separately** — if `large-v3` is required for multi-language Jarvis users, that's a build-level change; otherwise distil-small.en is fine for English-only soak.
+
+*End of v1.2 reprobe section.*
+
+---
+
+*End of spec. Implementation plan to follow once questions 1, 2, 4, 6, 7, 9 are answered. Question 8 (upstream coordination) is resolved by v1.2: most blockers fixed; remaining items tracked via new question 9 (model default).*
