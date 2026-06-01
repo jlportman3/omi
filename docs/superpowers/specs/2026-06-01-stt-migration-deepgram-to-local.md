@@ -1,7 +1,10 @@
 # STT Migration: Deepgram → rtx6000 local (Whisper / Voxtral)
 
 **Date:** 2026-06-01
-**Status:** Design draft. Scout passes complete (rtx6000 HTTP probe + backend integration map). Awaiting Joe's answers to the open questions at the bottom before Phase A implementation kicks off.
+**Last modified:** 2026-06-01
+**Status:** Design draft. Scout passes complete (rtx6000 HTTP probe + WS deep-probe + backend integration map). Awaiting Joe's answers to the open questions at the bottom before Phase A implementation kicks off.
+**Updated 2026-06-01 (am):** rtx6000 exposed an OpenAI Realtime API WebSocket at `ws://10.0.60.48:4000/v1/realtime`; streaming migration plan revised.
+**Updated 2026-06-01 (pm):** Deep-probe of the speaches Realtime endpoint surfaced hard blockers — server VAD fires exactly once per WS connection, `create_response=false` is silently ignored, no interim partials, no word-level timestamps. The Realtime endpoint is **not yet usable** as a Deepgram streaming replacement. Streaming cutover deferred until speaches is patched; in the interim the plan reverts to keep Deepgram for streaming and consider a chunked-batch shim if needed. See "Discovery v1.1" + "Realtime API deep-probe (2026-06-01 pm)".
 **Owner:** Joe Portman (@jlportman3)
 **Scope:** Backend STT layer only. Live streaming STT (BLE pendant + desktop sockets) and batch / pre-recorded STT (post-conversation re-transcribe, sync v2, voice messages, speech-profile sample verification, scripts). Touches `backend/utils/stt/*`, `backend/routers/{transcribe,sync,users,speech_profile}.py`, `backend/utils/{chat,speaker_sample,byok,subscription}.py`, `backend/utils/conversations/postprocess_conversation.py`, `backend/migrations/006_*`, `backend/pusher/requirements.txt`, `.env.template`. Out of scope: TTS (separate Kokoro/Orpheus spec), diarization (already local at `10.0.60.48:8094`), LLM (already on LiteLLM `10.0.60.48:4000`), language-pack expansion.
 
@@ -149,14 +152,44 @@ TitaNet + Sortformer. Already integrated by omi for diarization and speaker embe
 | `/v1/audio/diarization` | Sortformer; consumed by `pre_recorded.py:_post_sortformer` and `_merge_words_with_speakers` |
 | `/v1/audio/transcriptions` | **Not present.** This service does not do STT. |
 
+### speaches Realtime API (discovered 2026-06-01, deep-probed same day)
+
+After the rtx6000 agent upgrade landed, a re-probe of LiteLLM found a working OpenAI Realtime API WebSocket. A follow-up deep-probe (5 runs, real 23s pendant audio) confirmed the endpoint is reachable and transcription quality is good — **but the current speaches build is not yet usable as a streaming Deepgram replacement.** See "Realtime API deep-probe (2026-06-01 pm)" below for full details. Summary:
+
+- **WebSocket endpoint**: `ws://10.0.60.48:4000/v1/realtime` (alias also exposed at `ws://10.0.60.48:4000/openai/v1/realtime`)
+- **Protocol**: implements the public OpenAI Realtime API spec (`session.created` / `session.update` / `input_audio_buffer.append` / `conversation.item.input_audio_transcription.*` event grammar)
+- **Backed by**: `speaches` — open-source Realtime API implementation wrapping faster-whisper for STT and Kokoro for TTS
+- **Backing models** (from `session.created` event):
+  - `input_audio_transcription.model` = `Systran/faster-distil-whisper-small.en` (English-only default — switch to `Systran/faster-whisper-large-v3` via `session.update` for multi-lang; override IS accepted, verified)
+  - `model` = `Systran/faster-whisper-large-v3` (the assistant-side model)
+  - `speech_model` (TTS) = `speaches-ai/Kokoro-82M-v1.0-ONNX` (ignored for our STT-only use)
+  - `voice` = `af_heart`
+  - `turn_detection` = `server_vad`, `threshold=0.9`, `silence_duration_ms=550` — **probe-confirmed unchangeable** (echoed in `session.updated` but server keeps hardcoded defaults regardless of payload)
+  - `modalities` = `["audio", "text"]` by default; setting to `["text"]` via `session.update` IS accepted
+- **Auth**: `Authorization: Bearer ${OPENAI_API_KEY}` — same key already wired in `backend/.env` for LiteLLM
+- **Endpoints registered**: `GET /v1/realtime` (WS upgrade), `POST /v1/realtime/calls`, `POST /v1/realtime/client_secrets`
+- **Probe result**: `GET ws://10.0.60.48:4000/v1/realtime` with `Upgrade: websocket` → `101 Switching Protocols` (confirmed reachable from gpufarm)
+- **WS URL MUST include `?model=<litellm-known-model>` query param** — without it LiteLLM returns 403. Not in spec docs. The working probe URL was `ws://10.0.60.48:4000/v1/realtime?intent=transcription&model=whisper-large-v3`.
+- **`intent=transcription` query param**: accepted but is currently a no-op — the `session.created` event is identical to a default conversational session. speaches does not differentiate yet.
+- **Transcription quality (probe-verified)**: faster-whisper-large-v3 on Joe's 23s pendant clip produced the exact transcript `"So our LLM model."` — clean, correctly recognized, no hallucinations. Final-transcript latency `~348ms` after `speech_stopped`. Quality is not the blocker.
+- **DOES NOT emit interim partials**: probe confirmed only `conversation.item.input_audio_transcription.completed` is emitted (no `.delta` events). Final-only stream. Hard regression vs Deepgram's ~250ms partials, but recall current omi has `interim_results=False` so the in-app UX impact is zero (we already only ship finals).
+- **DOES NOT emit word-level timestamps**: the `.completed` event carries only a flat transcript string. No `word_offsets`, no per-word confidence, no segment boundaries. Speaker attribution must come from Sortformer windowing alone, not word-level alignment.
+- **DOES NOT diarize**: speaker IDs still come from our local Sortformer on `:8094` (unchanged). The Realtime API only emits text events; we will continue to run Sortformer in parallel for speaker labels.
+- **BLOCKERS preventing immediate adoption** (full list under "Realtime API deep-probe" section):
+  - Server VAD fires exactly **once per WS connection**. After the first `speech_started` / `speech_stopped` pair, no further VAD events emit even when more audio is streamed. Single-utterance-per-session is unworkable for Omi's long conversations.
+  - `turn_detection.create_response=false` is silently ignored — every transcript turn triggers a failed assistant-response attempt that emits an `error` event ~1s later. This is the likely root cause of the single-VAD bug.
+  - `turn_detection: null` (the spec-defined way to disable server VAD) is rejected with a pydantic validation error.
+  - Keepalive is broken — server doesn't respond to client pongs; the connection dies with code 1011 after ~30s if you enable client ping_interval. Must disable client pings or implement app-level keepalive via no-op append events.
+- **Net assessment**: not yet usable as a streaming Deepgram replacement. Quality is good; control plane is broken. Either (a) patch speaches upstream to honor `create_response=false` and re-arm VAD across turns (estimated 1-2 day fix), (b) reconnect WS per utterance with client-side VAD (high overhead, ~5 reconnects/min/speaker), or (c) defer streaming cutover and keep Deepgram for streaming while batch stays on whisper-local. **Recommendation**: defer; pursue (a) in parallel with Phase A.
+
 ### What's **not** reachable
 
 All other STT-candidate ports on rtx6000 are **closed** from gpufarm:
 - 9000 (faster-whisper-server default)
-- 8000-8099 except 8094 (speaches, etc.)
+- 8000-8099 except 8094 (speaches batch port, etc.)
 - 5000-5050, 7860-7862, 11434, 3000-3001
 
-There is **no standalone faster-whisper-server / speaches / Riva instance directly exposed** today. Anything we want as a streaming endpoint must either be exposed by the rtx6000 agent in a future session, or wrapped on top of the LiteLLM batch endpoint via chunked POSTs.
+The Realtime API on `:4000/v1/realtime` (LiteLLM-fronted) is the only streaming WebSocket exposed today. The standalone faster-whisper-server / speaches batch ports remain closed; we go through LiteLLM for everything.
 
 ## Provider choice per use case
 
@@ -171,28 +204,140 @@ Already implemented, already the default in `.env`. Six callers, all happy. Just
 
 Voxtral-mini stays in the codebase as a selectable alternative for **future audio-Q&A features** (Voxtral is an audio-LLM that can answer questions about audio in one shot — different product surface than transcription). It is **not** the recommended batch STT provider today because of the silence-hallucination behavior.
 
-### Streaming (live BLE / desktop PTT / multi-channel) → **dual-track**
+### Streaming (live BLE / desktop PTT / multi-channel) → **Keep Deepgram; defer streaming cutover**
 
-This is the contentious decision. Three viable paths, each with trade-offs:
+The 2026-06-01 morning discovery suggested the speaches Realtime API endpoint would unblock a clean streaming cutover. The same-day deep-probe (see "Realtime API deep-probe (2026-06-01 pm)") revealed that the current speaches build has four hard blockers that make it unusable as a Deepgram replacement today. Three paths now exist:
 
-**Path A — Keep Deepgram for streaming, only migrate batch (recommended for Phase A).**
-- Pros: Zero UX regression. Deepgram's interim latency (~200ms partial words on screen) is something neither Whisper nor Voxtral can match without a real streaming server. Speaker diarization is baked in; vocabulary biasing works as today. Implementation cost: ship the env-var plumbing + adapter shape, default everything to `deepgram` for streaming, validate batch is end-to-end local. This is the **lowest-risk first cut** and unblocks the cloud-zero goal for the larger of the two surfaces (batch re-transcribe and sync v2 generate the bulk of cloud DG minutes on Joe's account).
-- Cons: Doesn't get to cloud-zero. Still bills Deepgram for live audio.
-- **Recommendation**: this is the Phase A target.
+**Path A — Implement OpenAI Realtime API client targeting speaches on rtx6000 (BLOCKED until upstream fix).**
+- Plan: implement `RealtimeApiStreamingProvider` mapping our existing `streaming.py` contract onto Realtime API events. Connect to `ws://10.0.60.48:4000/v1/realtime?model=whisper-large-v3`. Send `session.update` to force STT-only mode and large-v3 model.
+- Pros: True streaming cutover with real latency parity to Deepgram. Cloud-zero. Reuses the existing OpenAI Bearer key. Transcription quality probe-confirmed clean (348ms final-transcript latency, accurate text).
+- Cons: **Hard-blocked by speaches behavior today**: (1) server VAD fires exactly once per WS connection then dies; (2) `create_response=false` is silently ignored and every turn triggers an `error` event that corrupts the session; (3) `turn_detection: null` is rejected; (4) WS keepalive is broken. None of these are tunable client-side — they require patches to speaches.
+- **Recommendation**: do **not** ship this in Phase B. Track an upstream issue with the rtx6000 agent to patch speaches (estimated 1-2 day fix). Once patched, Path A becomes the Phase B target. The adapter code can still be written speculatively in Phase A as `RealtimeApiStreamingProvider`, gated behind `STT_STREAMING_PROVIDER=realtime-local` (default off, will not exit alpha until speaches is fixed).
 
-**Path B — Chunked-batch shim against `whisper-large-v3` (Phase B target).**
-- Pusher / `process_audio_dg` replacement that buffers PCM into 3-5s rolling windows, POSTs each window to `/v1/audio/transcriptions`, and emits the words as a "final" segment per window. No interim transcripts. VAD-aware: instead of fixed 3s windows, flush a window every time `vad_gate` detects speech→silence (matches the existing `finalize()` semantics — the silence transition becomes the natural chunk boundary).
-- Pros: Zero new infra on rtx6000. Cloud-zero achievable today. Uses the existing Sortformer service for streaming diarization via parallel windowed POSTs.
-- Cons: No interim transcripts on the app — the live transcript view will tick once per VAD utterance (~1-3s) instead of every ~200ms. Latency budget per window: 283ms whisper + ~150ms diarization round-trip + chunk-assembly overhead. For 5s utterances total end-to-end is ~500-700ms vs. Deepgram's ~200ms.
-- **Recommendation**: this is the Phase B target. Acceptable for Joe's solo Jarvis test account because the desktop app's transcript view is glanced at, not read live. **Not acceptable for the BasedHardware fork's UX target without further work**.
+**Path B — Chunked-batch shim against `/v1/audio/transcriptions` (REINSTATED as contingency).**
+- Originally the recommended fallback; obsoleted by the morning Realtime API discovery; reinstated as a contingency because the Realtime endpoint is blocked.
+- Pros: relies only on the already-working batch endpoint; no upstream fixes needed; can be implemented and shipped without coordinating with rtx6000 agent.
+- Cons: UX-degraded (chunked latency ~3-5s per window vs Deepgram's ~250ms partials); higher complexity than originally hoped because we now have to choose between the chunked shim and waiting for speaches to be patched.
+- **Recommendation**: keep this as a documented option but **do not implement** unless Path A's upstream fix slips past 2 weeks. The probe confirmed Deepgram-on-streaming + whisper-local-on-batch (the Phase A configuration) is stable and acceptable as a long-term holding pattern.
 
-**Path C — Streaming WS endpoint on rtx6000 (Phase C target, requires separate agent work).**
-- Stand up `faster-whisper-server` or `speaches` or NVIDIA Riva ASR on rtx6000 with a `/v1/audio/transcriptions/stream` WebSocket. Implement a true streaming adapter against that.
-- Pros: True interim-transcript parity with Deepgram. Cloud-zero. Production-quality UX.
-- Cons: Not our session to do — rtx6000 agent has to expose the port, and Joe has to confirm there's VRAM headroom (memory note: `~5GB VRAM free on rtx6000`, Whisper-large needs ~3-5GB depending on quantization). Adapter implementation is significantly more complex (back-pressure, partial-result reconciliation, reconnect semantics).
-- **Recommendation**: keep on the roadmap but **do not block Phase A / B on it**.
+**Path C — Reconnect-per-utterance Realtime client (workaround for the single-VAD bug).**
+- Reconnect a fresh WS for every utterance (client-side VAD drives reconnect cadence). Each WS handles exactly one transcript before being discarded.
+- Pros: works around the speaches single-VAD bug without upstream changes.
+- Cons: ~5 WS reconnects/min per active speaker; reconnect cost (~23ms probe-measured + auth roundtrip) accumulates; session.update must be replayed each time; high error-surface area; defeats the point of a "long-lived streaming WS".
+- **Recommendation**: not pursued. Too brittle for production.
 
-The phased approach below picks **A → B → C → drop Deepgram entirely**.
+The revised phased approach: **A (adapter + env toggle, default=deepgram, speculative Realtime provider lands but stays off) → B (Jarvis stays on `deepgram` for streaming + `whisper-local` for batch; soak measures stability of the local batch path under real workload; upstream speaches fix tracked in parallel) → B' (once speaches is patched, flip Jarvis to `realtime-local` with the 7-day side-by-side soak originally planned for B) → C (Joe's personal account) → D (drop Deepgram entirely)**.
+
+## Discovery v1.1 (2026-06-01 am)
+
+**When/how**: re-probed LiteLLM on `10.0.60.48:4000` after the rtx6000 agent posted an upgrade notice. The earlier scout reported `/v1/realtime` as 404; the re-probe found the endpoint live and serving the OpenAI Realtime API event stream over WebSocket (`101 Switching Protocols` on upgrade).
+
+**What's new**:
+- A working OpenAI Realtime API WebSocket at `ws://10.0.60.48:4000/v1/realtime` (alias `/openai/v1/realtime`), backed by `speaches` (open-source Realtime impl) with `faster-whisper-large-v3` as the transcription model after `session.update`.
+- `server_vad` is built into the session; our existing `VadGate` may become redundant or shift role to "pre-filter before send" rather than "drive finalize()".
+- Auth piggybacks on the existing LiteLLM Bearer key — no new credentials to manage.
+
+**What it appeared to change (before deep-probe)**:
+- Dropped the Phase B chunked-batch shim plan. The "no streaming endpoint" risk seemed gone.
+- Phase B was reframed as a real streaming cutover (`STT_STREAMING_PROVIDER=realtime-local`).
+
+**What the same-day deep-probe then reversed** (see "Realtime API deep-probe" section below): the endpoint is reachable and transcription quality is good, but four hard blockers in the current speaches build make it unusable as a Deepgram streaming replacement today. Phase B reverts to "keep Deepgram for streaming; track upstream speaches fix; flip to `realtime-local` once patched (Phase B')".
+
+## Realtime API deep-probe (2026-06-01 pm)
+
+Streamed real Joe pendant audio (23s clip from conv 02f66cd4, chunked into 230×100ms PCM16 16kHz mono frames, base64-encoded) through the Realtime WS over 5 probe runs. Bearer auth via existing `OPENAI_API_KEY`. WS URL `ws://10.0.60.48:4000/v1/realtime?intent=transcription&model=whisper-large-v3` (probe-confirmed both query params required; without `model=` LiteLLM returns 403).
+
+### Latency (probe-measured)
+
+| Phase | ms |
+|-------|----|
+| WS upgrade (connect + 101) | 23 |
+| Time-to-first-partial | n/a — no `.delta` events are emitted |
+| Time-to-final after `speech_stopped` | 348 |
+| Time-to-final from WS open (full path) | ~8,770 (dominated by 3.2s of pre-speech audio + 550ms VAD silence threshold + 348ms transcription) |
+
+### Observed event types (full list)
+
+`session.created`, `session.updated`, `input_audio_buffer.speech_started`, `input_audio_buffer.speech_stopped`, `input_audio_buffer.committed`, `conversation.item.created`, `conversation.item.input_audio_transcription.completed`, `response.created`, `error`.
+
+**Not observed (even though spec implies they should exist)**: `conversation.item.input_audio_transcription.delta`. speaches/faster-whisper emits final-only.
+
+### Sample event shapes
+
+```jsonc
+// L8: the final transcript event — only carries flat text + item_id, NO timestamps, NO words, NO speaker, NO confidence
+{"content_index": 0,
+ "event_id": "event_wUQC75paBZrkJa1o3wE2C",
+ "item_id": "item_E7XFQnwY80LkaxDPGVq0C",
+ "transcript": "So our LLM model.",
+ "type": "conversation.item.input_audio_transcription.completed"}
+
+// L4: speech_started — audio_start_ms is offset within the streamed buffer, NOT wall-clock
+{"audio_start_ms": 3240,
+ "event_id": "event_2V3J0Nv4jHds293hCljEQ",
+ "item_id": "item_E7XFQnwY80LkaxDPGVq0C",
+ "type": "input_audio_buffer.speech_started"}
+
+// L11: ~1s after L8, speaches tries to generate an assistant response (despite create_response:false request),
+//      fails with no-LLM-wired error. CONNECTION STAYS OPEN but session is corrupted afterwards.
+{"error": {"message": "InternalServerError: Internal Server Error",
+           "type": "server_error", "code": null, "event_id": null, "param": null},
+ "event_id": "event_DgTGdZnUp8xdwfLe5n4nj",
+ "type": "error"}
+```
+
+### `session.update` — what works and what doesn't
+
+Working payload (probe-verified accepted; behavior matches the echo on these fields):
+```json
+{"type": "session.update",
+ "session": {"modalities": ["text"],
+             "input_audio_transcription": {"model": "Systran/faster-whisper-large-v3", "language": "en"},
+             "temperature": 0.0}}
+```
+
+| Field | Accepted by server | Actually applied | Notes |
+|-------|--------------------|------------------|-------|
+| `modalities=["text"]` | yes | yes | Forces STT-only echo; default is `["audio","text"]` |
+| `input_audio_transcription.model` | yes | yes | Switch from `Systran/faster-distil-whisper-small.en` (English-only) to `Systran/faster-whisper-large-v3` (multi-lang) |
+| `input_audio_transcription.language` | yes | yes | `null` lets speaches auto-detect; `"en"` pins |
+| `temperature` | yes | yes | `0.0` ok |
+| `instructions` | yes | yes (but not used in STT-only path) | Defaults to "helpful witty friendly AI" |
+| `turn_detection.threshold` | echoed | **NO** — server keeps hardcoded `0.9` regardless |
+| `turn_detection.silence_duration_ms` | echoed | **NO** — server keeps hardcoded `550ms` regardless |
+| `turn_detection.create_response` | echoed | **NO** — server always behaves as `true` (this is the root of the `error`-event-after-every-turn bug) |
+| `turn_detection.prefix_padding_ms` | rejected | n/a | Explicit `invalid_request_error` |
+| `turn_detection.interrupt_response` | rejected | n/a | Explicit `invalid_request_error` |
+| `turn_detection: null` | rejected | n/a | pydantic validation error — speaches violates the OpenAI spec which says `null` disables VAD |
+| `input_audio_format` | rejected | n/a | Hardcoded to `pcm16` |
+
+### Hard blockers (probe-confirmed, not speculation)
+
+1. **Single VAD turn per WS connection.** After the first `speech_started`/`speech_stopped` pair, the server stops detecting speech even when more audio is streamed. Verified in probe v4 by continuing to stream 18s of additional speech audio at 100ms cadence — zero subsequent `speech_started` events, zero subsequent transcripts. The session is dead after one utterance.
+2. **`create_response=false` is silently ignored.** Every transcript turn triggers a `response.created` followed ~1s later by an `InternalServerError` error event (because no LLM is wired in this speaches deployment). This is likely the root cause of #1 — the failed response.created corrupts session state and disarms the VAD.
+3. **`turn_detection: null` is rejected.** The OpenAI Realtime spec says `null` disables server VAD so the client can drive commits via `input_audio_buffer.commit`. speaches rejects `null` with a pydantic error, so client-driven commit is also not available.
+4. **WS keepalive is broken.** Server doesn't respond to client pongs. With `ping_interval` enabled on the asyncio websockets client, the connection dies with `1011 keepalive ping timeout` after ~30s. Must set `ping_interval=None` and rely on traffic to keep the connection alive, OR implement app-level keepalive (zero-payload `input_audio_buffer.append` every 5s).
+
+Probe also confirmed: `input_audio_buffer.commit` after VAD has already committed does NOT trigger a second transcription (4 manual commits after first VAD turn → 0 additional transcripts).
+
+### What works well (preserved for the eventual fix)
+
+- WS upgrade with `?model=X&intent=transcription` query params + Bearer auth.
+- `session.update` of `model` / `language` / `modalities` / `temperature`.
+- PCM16 16kHz mono audio streamed via base64-encoded `input_audio_buffer.append`.
+- Server VAD on the first turn detects speech accurately (3.2s onset in probe matched real audio onset).
+- Final transcript latency excellent (~348ms after `speech_stopped`).
+- Transcription quality clean and correct (`"So our LLM model."` matched recognizable speech in clip).
+
+### Net effect on the spec
+
+- Streaming Phase B **deferred** until speaches is patched to honor `create_response=false` and re-arm VAD across turns. Estimated upstream fix: 1-2 days in speaches source; tracked separately with the rtx6000 agent.
+- Phase A still ships the `RealtimeApiStreamingProvider` skeleton and integration test infrastructure — they will be ready to flip once speaches is patched.
+- Phase A's user-visible behavior is unchanged from today: Deepgram for streaming + whisper-local for batch.
+- Phase B reverts to "soak Phase A under real workload; do not flip streaming yet". Phase B' is the streaming cutover, scheduled after upstream fix lands.
+- New risks added: speaches control-plane stability, keepalive workaround, single-VAD bug regression on speaches upgrades.
+- Resolved open questions: `intent=transcription` is a no-op on the current build; word-level timestamps are not emitted; interim partials are not emitted; concurrent-session behavior is moot until single-VAD bug is fixed.
+- New open questions: do we wait for the upstream speaches fix, or pursue the chunked-batch shim (Path B in "Provider choice per use case") as a parallel path?
 
 ## Adapter design
 
@@ -254,8 +399,47 @@ class STTBatchProvider(ABC):
 | Provider | Streaming class | Batch class |
 |----------|-----------------|-------------|
 | `deepgram` | `DeepgramStreamingProvider` (today's `GatedDeepgramSocket` + `connect_to_deepgram_with_backoff`, refactored) | `DeepgramBatchProvider` (today's DG branch of `deepgram_prerecorded`) |
-| `whisper-local` | `WhisperStreamingProvider` (chunked-batch shim — see Phase B section) | `WhisperBatchProvider` (today's `local_whisper_prerecorded_from_bytes`, plus `_post_sortformer` merge) |
+| `realtime-local` | `RealtimeApiStreamingProvider` (NEW — connects to `ws://10.0.60.48:4000/v1/realtime`; see "Realtime API event-model translation" below) | (n/a — batch uses `whisper-local`) |
+| `whisper-local` | (OBSOLETED chunked-batch shim removed from plan) | `WhisperBatchProvider` (today's `local_whisper_prerecorded_from_bytes`, plus `_post_sortformer` merge) |
 | `voxtral-local` | not implemented — Voxtral is batch-only on LiteLLM | `VoxtralBatchProvider` (alternative selectable but disabled by default; reserved for audio-Q&A features) |
+
+### Realtime API event-model translation
+
+The OpenAI Realtime API event model is fundamentally different from Deepgram's word-level callbacks. The adapter must translate between the two. Event names + behavior below are probe-verified (see "Realtime API deep-probe (2026-06-01 pm)"):
+
+| Aspect | Deepgram (today) | Realtime API (speaches, as observed in probe) |
+|--------|------------------|-----------------------------------------------|
+| Transcript granularity | Word-level callbacks (`result.channel.alternatives[0].words = [{word, start, end, speaker:int, ...}]`) | Utterance-level only: `conversation.item.input_audio_transcription.completed` with a flat `transcript` string. **NO `.delta` events emitted by speaches** (probe-verified). |
+| Speaker IDs | Baked into each word | Not provided — we inject from Sortformer running in parallel |
+| Word timings | Per-word `start`/`end` (sub-second precision) | **None** — probe confirmed the `.completed` event carries only flat text. No `word_offsets`, no per-word confidence. Word timings must be reconstructed from Sortformer segment boundaries + `speech_started.audio_start_ms` / `speech_stopped.audio_end_ms` interpolation. |
+| VAD | Server-side endpointing (`endpointing=300`) emits a finalize event | Server-side `turn_detection: server_vad`, **`threshold=0.9` and `silence_duration_ms=550` are hardcoded** (probe-verified — payload values are echoed in `session.updated` but not actually applied). Emits `speech_started` / `speech_stopped` / `input_audio_buffer.committed` for the **first** turn only (single-VAD bug). |
+| Audio ingest | `socket.send(pcm16_bytes)` raw frames | `input_audio_buffer.append` event with base64-encoded PCM16. 100ms chunks worked cleanly in probe. `input_audio_format=pcm16` is hardcoded. |
+| Keepalive | DG SDK + our 5s `SafeDeepgramSocket` thread | **Broken on speaches** — server doesn't respond to client pongs; must disable `ping_interval` and rely on traffic or app-level no-op appends. |
+
+**`RealtimeApiStreamingProvider` responsibilities** (skeleton lands in Phase A; do not flip on until speaches is patched):
+- **Async WS lifecycle**: connect to `ws://10.0.60.48:4000/v1/realtime?intent=transcription&model=whisper-large-v3` (probe-verified that `?model=` query param is **mandatory** — without it LiteLLM returns 403, regardless of `session.update`). Send Bearer auth in the Upgrade request. Listen for `session.created`, then send `session.update` with the probe-verified working payload:
+  ```json
+  {"type":"session.update",
+   "session":{"modalities":["text"],
+              "input_audio_transcription":{"model":"Systran/faster-whisper-large-v3","language":null},
+              "temperature":0.0}}
+  ```
+  Do **not** include `turn_detection`, `input_audio_format`, or `instructions` overrides — probe showed these are either rejected outright or silently ignored. Document this in code with a link back to this spec.
+- **Disable client pings**: pass `ping_interval=None` to the `websockets` client to avoid the probe-observed 30s keepalive timeout. If idle-disconnect issues emerge in Phase B', add app-level no-op `input_audio_buffer.append` events as keepalives.
+- **Reconnect-on-error**: exponential backoff with jitter (mirror `connect_to_deepgram_with_backoff` shape: 3 retries, jittered 1s/2s/4s). On reconnect, replay `session.update` with the same payload.
+- **Single-VAD-turn workaround (until upstream fix)**: when the provider detects the post-`speech_stopped` `error` event (probe-verified to fire ~1s after every transcript), close the WS and reconnect for the next utterance. This is brittle (~5 reconnects/min/speaker, 23ms upgrade + auth roundtrip per reconnect) and is the reason streaming Phase B is deferred. Code path is implemented but gated behind `STT_STREAMING_PROVIDER=realtime-local` which stays off by default.
+- **PCM ingest**: receive raw PCM16LE bytes from the pusher socket, base64-encode, chunk into ≤100ms slices (probe used 100ms with no issues), emit `input_audio_buffer.append` events. Keep an internal frame counter so we can map Sortformer wall-clock back to audio offsets.
+- **Event-loop translator** — Realtime events → backend's `stream_transcript(segments)` callback shape:
+  - `session.created` / `session.updated` → log; trigger `session.update` after `session.created`.
+  - `input_audio_buffer.speech_started` → start a "current utterance" record; remember `audio_start_ms`.
+  - `input_audio_buffer.speech_stopped` → remember `audio_end_ms`.
+  - `input_audio_buffer.committed` → server-side commit fired; await `.completed` next.
+  - `conversation.item.created` → placeholder; carries `item_id` linking back to forthcoming `.completed`.
+  - `conversation.item.input_audio_transcription.completed` → final transcript. Reconcile with Sortformer window (covering same `audio_start_ms`-`audio_end_ms` slice) to pick a speaker label. Emit ONE `STTSegment` covering the full utterance, stamped from `audio_start_ms` to `audio_end_ms` plus our WS-open wall-clock anchor.
+  - `response.created` → ignored (would be the assistant-response side; STT-only mode means it stays `incomplete`).
+  - `error` (with message `InternalServerError`) → log warn; mark utterance done; trigger reconnect to work around single-VAD bug.
+  - **No `.delta` events** — partial-transcript code path is intentionally absent; this matches current omi behavior (`interim_results=False`).
+- **Speaker injection**: Sortformer runs in a parallel windowed POST loop (independent of the WS event stream). Per-window Sortformer outputs are reconciled against a per-session running TitaNet embedding bank so speaker IDs are stable across the session. The `.completed` event's `audio_start_ms`/`audio_end_ms` (from the matching `speech_started`/`speech_stopped` events) identifies which Sortformer window's labels to use.
 
 ### Factory + env-var dispatch
 
@@ -270,8 +454,8 @@ def get_streaming_provider(byok_key: Optional[str] = None) -> STTStreamingProvid
     if byok_key:
         return DeepgramStreamingProvider(api_key=byok_key)
     name = STT_STREAMING_PROVIDER
-    if name == 'deepgram':       return DeepgramStreamingProvider()
-    if name == 'whisper-local':  return WhisperStreamingProvider()
+    if name == 'deepgram':         return DeepgramStreamingProvider()
+    if name == 'realtime-local':   return RealtimeApiStreamingProvider()
     raise ValueError(f"Unknown STT_STREAMING_PROVIDER={name}")
 
 def get_batch_provider(byok_key: Optional[str] = None) -> STTBatchProvider:
@@ -291,7 +475,8 @@ def get_batch_provider(byok_key: Optional[str] = None) -> STTBatchProvider:
 | `backend/utils/stt/providers/base.py` (new) | Abstract base classes + `STTSegment` typed dict |
 | `backend/utils/stt/providers/__init__.py` (new) | Factory + env-var dispatch |
 | `backend/utils/stt/providers/deepgram.py` (new) | Extract today's DG streaming/batch code into provider classes |
-| `backend/utils/stt/providers/whisper_local.py` (new) | `WhisperBatchProvider` (move `local_whisper_prerecorded*` here); `WhisperStreamingProvider` (Phase B chunked shim) |
+| `backend/utils/stt/providers/realtime_local.py` (new) | `RealtimeApiStreamingProvider` — OpenAI Realtime API WS client targeting `ws://10.0.60.48:4000/v1/realtime` (speaches). Streaming-only; uses `whisper_local` for batch. |
+| `backend/utils/stt/providers/whisper_local.py` (new) | `WhisperBatchProvider` (move `local_whisper_prerecorded*` here). No `WhisperStreamingProvider` — chunked-batch shim plan obsoleted by 2026-06-01 Realtime API discovery. |
 | `backend/utils/stt/providers/voxtral_local.py` (new) | `VoxtralBatchProvider`; no streaming class |
 | `backend/utils/stt/streaming.py` | Replace `process_audio_dg` with `process_audio_streaming(...)` factory that gets a provider from the factory and wraps it in the VAD gate. Keep `deepgram_nova3_multi_languages` + `deepgram_nova3_languages` sets in place but rename module-level constants to `stt_multi_languages` / `stt_languages` with deprecation aliases. |
 | `backend/utils/stt/pre_recorded.py` | Replace `deepgram_prerecorded[_from_bytes]` body with a thin dispatcher to `get_batch_provider().transcribe(...)`. Keep the public function names as compatibility shims so the six callers don't have to change. |
@@ -301,7 +486,7 @@ def get_batch_provider(byok_key: Optional[str] = None) -> STTBatchProvider:
 | `backend/routers/sync.py`, `backend/routers/users.py`, `backend/routers/speech_profile.py`, `backend/utils/chat.py`, `backend/utils/speaker_sample.py`, `backend/utils/conversations/postprocess_conversation.py` | Update imports from `deepgram_prerecorded[_from_bytes]` → `stt_prerecorded[_from_bytes]` (alias kept for one release). |
 | `backend/utils/byok.py`, `backend/utils/subscription.py` | Keep `x-byok-deepgram` header as-is. BYOK still implies "the user pays Deepgram directly" — the header name is fine; only the operator-default changes. |
 | `backend/migrations/006_auto_set_transcription_mode.py` | Update import alias to `stt_multi_languages`. |
-| `backend/.env.template` | Add `STT_STREAMING_PROVIDER=deepgram` and `STT_BATCH_PROVIDER=deepgram` (template defaults stay safe; ops flip via `.env`). Add `WHISPER_BASE_URL`, `WHISPER_MODEL`, `VOXTRAL_MODEL`, `VOICE_EXTRAS_URL`, `SORTFORMER_MODEL` defaults. |
+| `backend/.env.template` | Add `STT_STREAMING_PROVIDER=deepgram` and `STT_BATCH_PROVIDER=deepgram` (template defaults stay safe; ops flip via `.env`). Add `WHISPER_BASE_URL`, `WHISPER_MODEL`, `VOXTRAL_MODEL`, `VOICE_EXTRAS_URL`, `SORTFORMER_MODEL` defaults. Add `REALTIME_WS_URL=ws://10.0.60.48:4000/v1/realtime`, `REALTIME_WS_QUERY=intent=transcription&model=whisper-large-v3` (the `model=` query param is probe-verified mandatory for LiteLLM-fronted speaches), `REALTIME_TRANSCRIPTION_MODEL=Systran/faster-whisper-large-v3`. Do **not** ship `REALTIME_VAD_THRESHOLD` / `REALTIME_VAD_SILENCE_MS` env vars — probe confirmed these are silently ignored by speaches; documenting them as tunable would mislead operators. Once speaches upstream honors these, add the env vars then. |
 | `backend/pusher/requirements.txt` | Leave `deepgram-sdk==4.8.1` in place through Phase A. Drop in Phase D after we are certain pusher has no remaining DG code paths. |
 | `backend/scripts/lint_async_blockers.py` | Add the new whisper-local streaming provider to the file allowlist (it issues async POSTs via `httpx.AsyncClient` from `utils/http_client.py` — already compliant). |
 
@@ -318,39 +503,45 @@ Hard-cutover vs. graceful fallback is the key open question. The recommendation 
 
 ## Rollout phases
 
-### Phase A — Adapter + batch cutover (2-3 days of focused work)
+### Phase A — Adapter + batch cutover + speculative Realtime client (3-4 days of focused work)
 
 - Implement `STTProvider` ABCs, factory, env vars.
 - Move existing DG streaming code into `DeepgramStreamingProvider` (refactor, no behavior change).
+- Implement `RealtimeApiStreamingProvider` against `ws://10.0.60.48:4000/v1/realtime?intent=transcription&model=whisper-large-v3`, with the probe-verified `session.update` payload (modalities/text + model + temperature + language only — do not include the silently-ignored or rejected fields). Lands in the codebase but **not** wired as the default and **not** user-facing yet. Gate the integration test for it on speaches version (env var `SPEACHES_VERSION_AT_LEAST=...`) so a stale build doesn't pretend it works.
 - Move existing whisper-local batch code into `WhisperBatchProvider` + `VoxtralBatchProvider`.
 - Move existing DG batch code into `DeepgramBatchProvider`.
 - Set `STT_BATCH_PROVIDER=whisper-local` in `.env` (preserves today's `STT_BATCH_BACKEND=whisper` semantics).
-- Set `STT_STREAMING_PROVIDER=deepgram` in `.env` (no behavior change).
-- Ship unit tests for adapter contract (`test_stt_provider_contract.py`) — both providers must satisfy the same interface and pass the same fixture WAVs.
-- Ship integration tests against rtx6000 (Whisper batch round-trip on a 30s test clip, language-detect round-trip, diarization-merge round-trip).
+- Set `STT_STREAMING_PROVIDER=deepgram` in `.env` (NO behavior change for streaming — the new Realtime provider ships in code but stays off by default and is blocked by upstream speaches bugs).
+- Ship unit tests for adapter contract (`test_stt_provider_contract.py`) — all providers must satisfy the same interface and pass the same fixture WAVs.
+- Ship integration tests against rtx6000 (Whisper batch round-trip on a 30s test clip + Realtime WS connect + `session.update` + 5s PCM round-trip + single-utterance transcript-completed assertion). The Realtime test asserts only what the current speaches build supports; it will be extended once speaches is patched.
 - Validate every batch caller (six) still works end-to-end on Joe's deployment.
-- **Exit criteria**: 24h on Joe's listen pipeline with `STT_BATCH_PROVIDER=whisper-local` and zero regressions in the post-conversation re-transcribe path. Memory-attribution Layer 2 keeps working (it depends on segment shape, not provider).
+- **Exit criteria**: 24h on Joe's listen pipeline with `STT_BATCH_PROVIDER=whisper-local` and zero regressions in the post-conversation re-transcribe path. Memory-attribution Layer 2 keeps working. Realtime provider passes the (limited) integration test but is not user-facing yet.
 
-### Phase B — Streaming chunked-batch shim (4-7 days, Jarvis only)
+### Phase B — Soak Phase A under real workload + track speaches upstream fix (open-ended)
 
-- Implement `WhisperStreamingProvider` as a VAD-driven chunked-batch shim:
-  - Buffer PCM in memory until `vad_gate` flags a speech→silence transition or 5s elapsed (whichever first).
-  - On flush: POST the buffered window to `/v1/audio/transcriptions` (Whisper) and `/v1/audio/diarization` (Sortformer) in parallel via `asyncio.gather`.
-  - Merge words+speakers via `_merge_words_with_speakers` (reuse the batch code).
-  - Emit segments via `on_segment` callback, timestamps remapped to wall-clock by the same `DgWallMapper` (renamed `STTWallMapper`).
-  - `finalize()` = force-flush any pending window even before VAD silence.
-  - `is_dead` = LiteLLM has returned ≥3 consecutive non-2xx responses.
-- Flip Jarvis test account to `STT_STREAMING_PROVIDER=whisper-local`.
+**Streaming cutover deferred.** The deep-probe (2026-06-01 pm) showed the current speaches build is blocked by four issues (see "Realtime API deep-probe"). Phase B is reframed:
+
+- Keep `STT_STREAMING_PROVIDER=deepgram` on Jarvis. **Do not flip to `realtime-local` yet.**
+- Soak `STT_BATCH_PROVIDER=whisper-local` for 7 continuous days on Jarvis. Validate batch-path stability under real workload (post-conversation re-transcribe, sync v2, voice messages, speech-profile samples). Capture per-caller latency and error rate.
+- **In parallel**, file a fix request with the rtx6000 agent for the speaches blockers: (1) honor `create_response=false`, (2) re-arm VAD across turns after a transcript-completed event, (3) accept `turn_detection: null` per OpenAI spec, (4) respond to client WS pongs. Reference this spec section for the exact probe-verified failure modes.
+- **Decision gate at +7 days**: if speaches has been patched, proceed to Phase B' below. If not, decide between (i) wait longer, or (ii) implement the chunked-batch shim (Path B in "Provider choice per use case") as a non-realtime workaround. Recommendation: wait if the upstream fix has a credible ETA; implement chunked-batch only if speaches is stuck >2 weeks.
+- **Exit criteria**: 7 days clean on Jarvis batch + a green light from one of (a) speaches patched, (b) Joe approves chunked-batch shim, (c) Joe approves indefinite "Deepgram-for-streaming forever" stance.
+
+### Phase B' — Flip Jarvis to Realtime (7-day side-by-side soak; gated on speaches fix)
+
+- Only run this phase **after** speaches is patched and the integration test (the one gated by `SPEACHES_VERSION_AT_LEAST`) starts passing.
+- Flip Jarvis to `STT_STREAMING_PROVIDER=realtime-local`. Real streaming cutover.
 - **Side-by-side validation** for 7 continuous days: run a parallel shadow Deepgram session (read-only, no segments written to Firestore) for every Jarvis conversation; diff word error rate, latency-to-first-word, latency-to-final-word, speaker-attribution accuracy.
-- Decision gate: if Jarvis WER and latency are within 15% of Deepgram for English, proceed to Phase C. If not, debug or fall back to Phase A defaults and escalate to the rtx6000 agent for Path C work.
+- Validate against the 2026-06-01 19:48 "Gesture" conversation and other recent Jarvis sessions as benchmark fixtures.
+- If speaches starts honoring `turn_detection.threshold` / `silence_duration_ms` in the patched build, tune those (Deepgram's `endpointing=300` is the latency target). Until then, leave them out of the `session.update` payload to avoid sending no-op fields.
+- Decision gate: if Jarvis WER and latency are within 15% of Deepgram for English, proceed to Phase C. If not, debug or temporarily fall back to `STT_STREAMING_PROVIDER=deepgram` and escalate (speaches version pin, model swap, threshold tune).
 - **Exit criteria**: 7 days clean on Jarvis with no regressions in conversation extraction quality (measured against the memory-critic LLM scoring pipeline).
 
-### Phase C — Cut Joe's personal account (1-2 days)
+### Phase C — Cut Joe's personal account (1-2 days; gated on Phase B' clean exit)
 
-- Joe's personal omi account (`jlportman3@gmail.com`) is **not yet on self-host** per memory note `user_google_accounts.md`. This phase is forward-looking: it assumes Joe has migrated his personal account to the self-host backend before flipping the provider.
-- Once on self-host: flip `STT_STREAMING_PROVIDER=whisper-local` for Joe's account-scoped env (or globally if Jarvis-as-second-account is on the same backend instance).
-- 7-day soak period mirroring Phase B.
-- If a true streaming WS endpoint has landed on rtx6000 by this point (Path C from the provider-choice section), the streaming provider name becomes `whisper-stream-ws` (new concrete class). The adapter shape is unchanged.
+- Joe's personal omi account (`jlportman3@gmail.com`) is **not yet on self-host** per memory note `user_google_accounts.md`. This phase is forward-looking: it assumes Joe has migrated his personal account to the self-host backend before flipping the provider. **Separate work item.**
+- Once on self-host: flip `STT_STREAMING_PROVIDER=realtime-local` for Joe's account-scoped env (or globally if Jarvis-as-second-account is on the same backend instance).
+- 7-day soak period mirroring Phase B'.
 
 ### Phase D — Remove Deepgram code (1 day, once stable)
 
@@ -363,11 +554,14 @@ Hard-cutover vs. graceful fallback is the key open question. The recommendation 
 
 ### Latency budget for streaming
 
-| Metric | Deepgram today | Phase B (chunked Whisper) | Mitigation |
-|--------|---------------|---------------------------|------------|
-| Time-to-first-word | ~200ms | First word lands at end of first VAD utterance, typically 1-3s | Surface a "transcribing…" placeholder during the chunk gap. Already implicit in the BLE pendant UX (no live captions). |
-| End-to-end word latency | ~300ms (final after VAD endpointing=300ms) | 283ms whisper + ~150ms diarization + chunk-assembly = ~500-700ms per 5s window | Cap window at 3-5s. Run whisper + sortformer POSTs in parallel via `asyncio.gather`. |
-| Concurrent sessions per LiteLLM endpoint | Unlimited (Deepgram cloud) | Limited by rtx6000 GPU concurrency on whisper-large | Test concurrency against rtx6000 agent. If hit, add request queueing in `WhisperStreamingProvider`. |
+Numbers below for the Realtime API column are probe-measured (2026-06-01 pm deep-probe, 23s pendant audio, 100ms chunks, faster-whisper-large-v3). All numbers are on a quiet rtx6000 with no concurrent omi load.
+
+| Metric | Deepgram today | Phase B' (Realtime API / speaches, probe-measured) | Mitigation |
+|--------|---------------|----------------------------------------------------|------------|
+| Time-to-first-partial | ~200ms (Deepgram interim) | **n/a** — no `.delta` events emitted by speaches | UX impact zero (omi already runs `interim_results=False`). Do not surface partials. |
+| Time-to-final after VAD silence | ~300ms (DG `endpointing=300`) | **348ms** (probe-measured) | Acceptable parity once speaches is patched. |
+| End-to-end first-final from speech onset | ~speech_duration + 300ms | speech_duration + 550ms (hardcoded `silence_duration_ms`) + 348ms transcription | ~250ms regression vs Deepgram. Mitigated only once speaches honors a lower `silence_duration_ms`. |
+| Concurrent sessions per LiteLLM endpoint | Unlimited (Deepgram cloud) | Untested under load — single-VAD bug blocks meaningful concurrency testing today | Re-measure once speaches is patched. Test concurrency against rtx6000 agent; if hit, add session queueing in `RealtimeApiStreamingProvider`. |
 
 ### Language detection
 
@@ -384,20 +578,47 @@ Hard-cutover vs. graceful fallback is the key open question. The recommendation 
 ### Speaker labels (diarization provenance)
 
 - Deepgram streaming bakes diarization into the same WebSocket message (`words[i].speaker:int`).
-- Whisper has no diarization. Sortformer runs in parallel.
-- **Risk in streaming**: Sortformer is batch-only today (POST `/v1/audio/diarization`). Per-window Sortformer calls produce **per-window-local speaker IDs** (window A's `speaker_0` and window B's `speaker_0` may be different people). The memory-attribution pipeline's Layer 2 cluster-vote algorithm assumes stable IDs across the session.
-- **Mitigation**: post-process each window's Sortformer output by clustering its speaker centroids against a per-session running embedding bank (one TitaNet embedding per speaker label). New speakers get a new global ID; existing speakers get their stable ID. This is essentially online speaker clustering — small extra work in `WhisperStreamingProvider._reconcile_speakers()`. The TitaNet service is already hot.
+- The Realtime API has no diarization. Sortformer runs in parallel.
+- **Risk in streaming**: Sortformer is batch-only today (POST `/v1/audio/diarization`). The Realtime provider runs Sortformer in a parallel windowing loop (independent of the WS event stream). Per-window Sortformer calls produce **per-window-local speaker IDs** (window A's `speaker_0` and window B's `speaker_0` may be different people). The memory-attribution pipeline's Layer 2 cluster-vote algorithm assumes stable IDs across the session.
+- **Mitigation**: post-process each window's Sortformer output by clustering its speaker centroids against a per-session running embedding bank (one TitaNet embedding per speaker label). New speakers get a new global ID; existing speakers get their stable ID. This is online speaker clustering — implemented in `RealtimeApiStreamingProvider._reconcile_speakers()`. The TitaNet service is already hot.
 
 ### Interim transcripts UX
 
-- Deepgram emits interim partials every ~200ms. Today the omi backend has `interim_results=False`, so we don't actually surface partials to the app — every segment we push is final. **This means the UX impact of dropping interim transcripts is zero**: omi already only ships final segments. Phase B's "no interims" property is not a regression against current shipped behavior.
-- This was the single biggest concern going in; on inspection it turns out to be a non-issue.
+- Deepgram emits interim partials every ~200ms. Today the omi backend has `interim_results=False`, so we don't actually surface partials to the app — every segment we push is final. **This means the UX impact of any partials policy is zero**: omi already only ships final segments.
+- Probe confirmed speaches **does not emit `.delta` events at all** — only `conversation.item.input_audio_transcription.completed`. Since current omi already runs final-only, the missing partials are not a regression for omi. If a future omi feature wants live-typing UX, it will have to wait for speaches to add `.delta` (or use a different provider).
 
 ### Error recovery
 
 - Deepgram WS reconnect: today's `connect_to_deepgram_with_backoff` retries 3× with exponential jitter.
-- Whisper chunked-batch: each window POST is independently retryable. On 3 consecutive failures the provider declares `is_dead`, the pusher socket closes, the client reconnects, and a new provider instance is built. Same UX as Deepgram cold-restart.
-- **Risk**: rtx6000 LiteLLM goes down mid-conversation. Without cross-provider fallback, the conversation transcription stalls until LiteLLM is back. **Mitigation**: optional `STT_STREAMING_FALLBACK=deepgram` env var (default OFF for cloud-zero; ON during the Phase B-C transition if Joe wants the safety net).
+- Realtime API WS reconnect: `RealtimeApiStreamingProvider` mirrors the same backoff shape. On reconnect, a new `session.update` re-pins STT-only mode + transcription model + language. Any audio buffered during the reconnect gap is replayed (bounded by 5s buffer; older audio is dropped with a warning log).
+- **Per-utterance reconnect (single-VAD workaround, until upstream fix)**: until speaches re-arms VAD across turns, the provider must reconnect a fresh WS for each utterance. Probe-measured upgrade time is 23ms; per-reconnect cost is ~23ms WS + auth + `session.update` round-trip. At ~5 utterances/min/speaker this is 5 reconnects/min of provider churn. This is the primary reason streaming Phase B is deferred behind the upstream fix.
+- **Risk**: rtx6000 LiteLLM goes down mid-conversation. Without cross-provider fallback, the conversation transcription stalls until LiteLLM is back. **Mitigation**: optional `STT_STREAMING_FALLBACK=deepgram` env var (default OFF for cloud-zero; ON during the Phase B'/C transition if Joe wants the safety net).
+
+### speaches single-VAD-turn bug (BLOCKER, probe-confirmed 2026-06-01 pm)
+
+- After the first `speech_started`/`speech_stopped` pair on a WS connection, the server stops detecting speech even when more audio is streamed. Verified by probe v4 with 18s of additional speech audio post-first-turn producing zero subsequent events.
+- **Root cause hypothesis**: `turn_detection.create_response=true` (silently unchangeable) triggers a failed assistant-response generation flow that emits an `error` event ~1s after every transcript. This appears to corrupt session state and disarm VAD.
+- **Mitigation**: (preferred) file upstream patch with rtx6000 agent — speaches must (a) honor `create_response=false` in `session.update`, and (b) re-arm VAD after each transcript even when the response.created path errors out. (workaround) reconnect per utterance — implemented in `RealtimeApiStreamingProvider` but production-discouraged due to reconnect churn. **This is the single reason streaming Phase B is deferred.**
+
+### speaches `turn_detection` knobs are unchangeable (probe-confirmed 2026-06-01 pm)
+
+- `turn_detection.threshold` / `silence_duration_ms` / `create_response` are echoed in `session.updated` but the server keeps hardcoded `0.9` / `550ms` / `true` regardless. `prefix_padding_ms` and `interrupt_response` are explicitly rejected. `turn_detection: null` (the OpenAI-spec-compliant way to disable server VAD) is rejected with a pydantic validation error.
+- **Mitigation**: do not ship `REALTIME_VAD_THRESHOLD` / `REALTIME_VAD_SILENCE_MS` env vars in Phase A — they would mislead operators into thinking they have a knob they don't. Once speaches honors these, add the env vars in the same PR as the speaches version bump.
+
+### speaches WS keepalive is broken (probe-confirmed 2026-06-01 pm)
+
+- Server doesn't respond to client pongs. With the `websockets` Python client's default `ping_interval=20s`, the connection dies with `1011 keepalive ping timeout` after ~30s of idle.
+- **Mitigation**: `RealtimeApiStreamingProvider` must construct the WS client with `ping_interval=None`. If silent-idle periods longer than ~30s become an issue in production (rare for an active pendant), emit a zero-payload `input_audio_buffer.append` event every 5s as an application-level keepalive.
+
+### faster-whisper-large-v3 multi-lang accuracy vs Deepgram nova-3-multi (probe-partially-measured 2026-06-01)
+
+- Probe transcribed 23s of Joe's pendant audio cleanly with the override to `Systran/faster-whisper-large-v3` (`"So our LLM model."` — accurate). This is a single sample, single language (English), not a WER measurement.
+- **Mitigation**: Phase B' 7-day side-by-side soak captures per-conversation WER deltas across the multi-language set. If accuracy regresses >15% on any well-represented language, debug (model swap to a larger faster-whisper variant if available on rtx6000, or pin language explicitly per user) before proceeding to Phase C.
+
+### Realtime API spec evolution + speaches divergence (probe-confirmed 2026-06-01)
+
+- The OpenAI Realtime API is pre-1.0; speaches diverges from the spec in several places (probe-confirmed): `turn_detection: null` rejected when spec says it should disable VAD; `intent=transcription` query param accepted but no-op; `?model=` query param required when spec does not document this; `create_response=false` silently ignored.
+- **Mitigation**: pin speaches version in deployment notes. Document the probe-verified working `session.update` payload in code comments + this spec. On any speaches upgrade, re-run the integration test suite (Phase A) before promoting. Maintain the divergence list in this spec; update on each rtx6000 agent speaches upgrade.
 
 ### BYOK preservation
 
@@ -417,17 +638,18 @@ Hard-cutover vs. graceful fallback is the key open question. The recommendation 
 - `tests/unit/test_stt_provider_contract.py` (new): every concrete `STTBatchProvider` must accept the same fixture WAV (5s English, 5s Spanish, 1s silence) and return the same DG-shaped envelope. Every `STTStreamingProvider` must accept the same fixture PCM stream and emit comparable segments (same start/end within 100ms tolerance, same speaker count, text WER < 0.20 vs reference).
 - `tests/unit/test_whisper_batch.py` (extend): exercise the new provider class directly; current test only hits the legacy function shim.
 - `tests/unit/test_stt_factory.py` (new): env-var dispatch, BYOK override, invalid name raises `ValueError`.
-- `tests/unit/test_byok_security.py` (extend): assert `STT_STREAMING_PROVIDER=whisper-local` + user-supplied `x-byok-deepgram` still routes the user through DG, not through whisper-local.
+- `tests/unit/test_byok_security.py` (extend): assert `STT_STREAMING_PROVIDER=realtime-local` + user-supplied `x-byok-deepgram` still routes the user through DG, not through realtime-local.
 
 ### Integration tests (Phase A — gated on rtx6000 reachability)
 
 - `tests/integration/test_whisper_against_rtx6000.py` (new): synthetic 30s WAV with three speakers (TTS-generated, scripted), POST to LiteLLM, validate word count, language detection, diarization merge. Skipped if `RTX6000_REACHABLE=0`.
-- `tests/integration/test_stt_concurrent_sessions.py` (new): 4 parallel sessions × 30s WAVs against `whisper-large-v3`. Validates rtx6000 doesn't choke on omi's typical concurrent load. Skipped if `RTX6000_REACHABLE=0`.
+- `tests/integration/test_realtime_api_against_rtx6000.py` (new): WS connect to `ws://10.0.60.48:4000/v1/realtime`, send `session.update` to STT-only, stream a 5s WAV via `input_audio_buffer.append`, assert `conversation.item.input_audio_transcription.completed` arrives with non-empty text. Skipped if `RTX6000_REACHABLE=0`.
+- `tests/integration/test_stt_concurrent_sessions.py` (new): 4 parallel sessions × 30s WAVs (mix of batch `whisper-large-v3` and Realtime WS). Validates rtx6000 doesn't choke on omi's typical concurrent load. Skipped if `RTX6000_REACHABLE=0`.
 - Existing `test_dg_start_guard.py`, `test_streaming_deepgram_backoff.py` keep passing against `STT_STREAMING_PROVIDER=deepgram`.
 
 ### End-to-end (Phase B)
 
-- Run Jarvis listen session for a 30-minute conversation under `STT_STREAMING_PROVIDER=whisper-local`. Validate:
+- Run Jarvis listen session for a 30-minute conversation under `STT_STREAMING_PROVIDER=realtime-local`. Validate:
   - All segments persisted to Firestore.
   - Memory-attribution Layer 2 produces non-empty `is_user` attribution.
   - Memory extractor produces ≥1 fact with provenance pointing back to a Phase-B-captured segment.
@@ -437,22 +659,33 @@ Hard-cutover vs. graceful fallback is the key open question. The recommendation 
 
 ## Open questions for the user
 
-These are concrete decisions Joe needs to make before Phase A implementation kicks off. Each blocks specific code paths.
+These are concrete decisions Joe needs to make. Each blocks specific code paths. The 2026-06-01 deep-probe resolved several earlier questions and surfaced new ones; resolved items are listed at the end.
 
-1. **Phase A streaming default — keep `deepgram` or hard-cut to `whisper-local` chunked-batch?** Recommendation: keep `deepgram` for Phase A, flip to `whisper-local` in Phase B with the 7-day Jarvis side-by-side soak. **Alternative**: hard-cut now for the cloud-zero principle, accept the ~1-3s "transcribing…" gap as the new UX. Pick one.
+1. **Phase B path forward — wait for upstream speaches fix, or implement chunked-batch shim as a parallel track?** The probe-confirmed single-VAD bug + ignored `create_response=false` mean `realtime-local` cannot ship today. Two options: **(a)** wait for the rtx6000 agent to patch speaches (estimated 1-2 day fix, but real ETA unknown) and keep `STT_STREAMING_PROVIDER=deepgram` indefinitely until then; **(b)** also build the chunked-batch shim (Path B in "Provider choice per use case") as a non-realtime intermediate so streaming users can move off Deepgram even before speaches is fixed. Recommendation: (a) — accept Deepgram-for-streaming as the holding pattern, since the probe showed it's stable and our batch path is already local. Only fall to (b) if upstream slips >2 weeks.
 
-2. **Cross-provider fallback — implement `STT_STREAMING_FALLBACK=deepgram` (default OFF), or skip it entirely?** Implementing it costs ~half a day and preserves a Deepgram safety net during the Phase B-C transition. Skipping it keeps the codebase simpler and honors cloud-zero. Recommendation: implement it, leave it OFF in the template, flip ON during Phase B-C if needed.
+2. **Cross-provider fallback — implement `STT_STREAMING_FALLBACK=deepgram` (default OFF), or skip it entirely?** Implementing it costs ~half a day and preserves a Deepgram safety net during the Phase B'/C transition. Skipping it keeps the codebase simpler and honors cloud-zero. Recommendation: implement it, leave it OFF in the template, flip ON during Phase B'/C if speaches stability proves shaky.
 
 3. **Vocabulary biasing in batch — accept `initial_prompt` as a degraded substitute, or selectively route batch with vocab through Voxtral-mini?** Voxtral's audio-LLM prompt channel can absorb the vocab list with measurable effect. The trade-off is Voxtral's ~5× higher latency and silence-hallucination behavior (manageable in batch where audio is non-silent). Recommendation: ship with `initial_prompt` first, add Voxtral-as-vocab-aware-batch-fallback as a Phase B+ stretch goal.
 
 4. **BYOK in Phase D — keep `x-byok-deepgram` support after we delete `DeepgramStreamingProvider` for the operator default, or drop BYOK-DG entirely?** Recommendation: keep the BYOK code path through Phase D — it's a per-request DG client construction, no module-level dependencies — and only drop it if it becomes a maintenance burden. **Alternative**: drop BYOK-DG, document that BYOK users now bring their OpenAI key (used against LiteLLM passthrough or a separate openai.com Whisper endpoint).
 
-5. **Streaming WS endpoint on rtx6000 — request from the rtx6000 agent now, or wait until Phase B chunked-batch lands and we can measure the actual UX gap?** Recommendation: file the request now (separate task to the rtx6000 agent) but do not block Phase A or B on its delivery. If `faster-whisper-server` or `speaches` is up by the time Phase B finishes, swap the streaming provider class; otherwise keep the chunked-batch shim.
+5. **Language scope** — keep the existing `deepgram_nova3_multi_languages` set as the only supported `language=multi` whitelist, or expand to Whisper's full 99-language list? Recommendation: keep today's set in v1 (no UI/UX changes, no user expectations to manage). Expand in a separate spec once Phase D is stable.
 
-6. **Language scope** — keep the existing `deepgram_nova3_multi_languages` set as the only supported `language=multi` whitelist, or expand to Whisper's full 99-language list? Recommendation: keep today's set in v1 (no UI/UX changes, no user expectations to manage). Expand in a separate spec once Phase D is stable.
+6. **Pusher service** — the `pusher/main.py` itself has no remaining DG references (Phase-1 scout confirmed), but `pusher/requirements.txt` still pins `deepgram-sdk==4.8.1`. Confirm: do we drop the dep in Phase A (lower attack surface, fewer build artifacts) or wait until Phase D (parallel removal with the rest of DG code)? Recommendation: Phase D — keep one consistent removal point.
 
-7. **Pusher service** — the `pusher/main.py` itself has no remaining DG references (Phase-1 scout confirmed), but `pusher/requirements.txt` still pins `deepgram-sdk==4.8.1`. Confirm: do we drop the dep in Phase A (lower attack surface, fewer build artifacts) or wait until Phase D (parallel removal with the rest of DG code)? Recommendation: Phase D — keep one consistent removal point.
+7. **`?model=` query param on the Realtime WS URL (NEW 2026-06-01 pm)** — probe confirmed the param is **mandatory** (LiteLLM returns 403 without it) and not documented in the OpenAI spec. Do we hardcode it in `RealtimeApiStreamingProvider`, or make it an env var (`REALTIME_WS_QUERY=intent=transcription&model=whisper-large-v3`)? Recommendation: env var (defaults to the working probe value), so operators with a different LiteLLM model alias can override without code changes.
+
+8. **Upstream speaches patch coordination** — who files the issue with the rtx6000 agent: this spec author, or Joe? Recommendation: this spec author files a concise issue referencing this spec's "Realtime API deep-probe" section as the failing-behavior repro. The four blockers (single VAD, ignored `create_response=false`, rejected `turn_detection: null`, broken keepalive pong) are described concretely enough to act on.
+
+### Resolved by the 2026-06-01 deep-probe (no longer open)
+
+- ~~Whether `intent=transcription` query param meaningfully changes the event stream.~~ **No** — accepted but no-op on the current speaches build.
+- ~~Whether `session.update` to set `modalities=["text"]` + `create_response=false` cleanly disables the assistant-response side.~~ **Partially** — `modalities=["text"]` applies; `create_response=false` is silently ignored.
+- ~~Whether speaches exposes word-level timestamps in `.completed` events.~~ **No** — only flat transcript text. Word timings must come from Sortformer.
+- ~~Whether speaches emits `.delta` partials.~~ **No** — final-only.
+- ~~Whether `turn_detection.threshold` / `silence_duration_ms` are tunable.~~ **No** — silently ignored despite being echoed in `session.updated`.
+- ~~End-to-end time-to-final-word latency.~~ **~348ms after `speech_stopped`** — competitive with Deepgram once single-VAD bug is fixed.
 
 ---
 
-*End of spec. Implementation plan to follow once questions 1, 2, 4, 5, 7 are answered.*
+*End of spec. Implementation plan to follow once questions 1, 2, 4, 6, 7 are answered. Question 8 (upstream coordination) is independent and can proceed immediately.*
