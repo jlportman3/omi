@@ -99,8 +99,18 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
     """A single WebSocket-backed STT session against speaches.
 
     See module docstring for the probe-verified protocol invariants. The
-    public method names match ``SafeDeepgramSocket`` so ``routers/transcribe.py``
-    can swap providers via the factory without source changes.
+    public method names + sync/async signature match ``SafeDeepgramSocket``
+    so ``routers/transcribe.py`` can swap providers via the factory without
+    source changes.
+
+    Sync/async boundary:
+        The public surface (``send`` / ``finalize`` / ``finish`` /
+        ``is_connection_dead``) is SYNC because transcribe.py calls them
+        without ``await`` (see streaming_provider.py docstring). Internally
+        the WebSocket I/O is async — we schedule it onto the caller's event
+        loop (captured in ``connect()`` via ``asyncio.get_running_loop()``)
+        using ``asyncio.run_coroutine_threadsafe`` / ``loop.create_task`` so
+        the sync wrappers stay non-blocking.
     """
 
     provider_name_value = 'realtime-local'
@@ -124,7 +134,15 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
         self._ws: Optional[Any] = None  # websockets.WebSocketClientProtocol
         self._dead = False
         self._closed = False
+        self._death_reason: Optional[str] = None  # Mirrors SafeDeepgramSocket.death_reason
         self._reader_task: Optional[asyncio.Task] = None
+
+        # Event loop captured during connect() — used by the sync wrappers to
+        # schedule async WS work without blocking. transcribe.py runs in this
+        # same loop so loop.create_task is safe; we use
+        # run_coroutine_threadsafe defensively in case a caller invokes
+        # send/finish from a different loop or a worker thread.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Wall-clock anchor — set when WS opens. ``audio_*_ms`` from the
         # server resets per item so we ignore them as absolute timestamps
@@ -146,8 +164,29 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
     def provider_name(self) -> str:
         return self.provider_name_value
 
-    def is_alive(self) -> bool:
-        return not self._dead and not self._closed
+    @property
+    def is_connection_dead(self) -> bool:
+        """True once the WS is closed or a fatal error has latched.
+
+        One-way latch — mirrors ``SafeDeepgramSocket.is_connection_dead``.
+        ``transcribe.py:flush_stt_buffer`` checks this before each ``send``
+        and stops forwarding audio when it flips True.
+        """
+        return self._dead or self._closed
+
+    @property
+    def is_finished(self) -> bool:
+        """True once ``finish()`` has been called. Idempotency guard for tests."""
+        return self._closed
+
+    @property
+    def death_reason(self) -> Optional[str]:
+        """Why the connection died, or None if still alive.
+
+        Mirrors ``SafeDeepgramSocket.death_reason`` — transcribe.py reads this
+        for the dead-connection log line at line 2438.
+        """
+        return self._death_reason
 
     async def connect(self) -> None:
         """Open the WS, send session.update, start the reader task.
@@ -187,9 +226,14 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
         )
         self._wall_clock_open = time.time()
 
+        # Capture the calling event loop so the sync public API
+        # (send/finalize/finish) can schedule async WS work onto it without
+        # blocking. transcribe.py's WS handler runs in this same loop.
+        self._loop = asyncio.get_running_loop()
+
         await self._send_session_update()
 
-        # Spawn the background reader. We do NOT await it; ``send_audio`` /
+        # Spawn the background reader. We do NOT await it; ``send`` /
         # ``finish`` interact with the same WS concurrently.
         self._reader_task = asyncio.create_task(self._event_loop(), name='realtime-stt-reader')
 
@@ -213,21 +257,30 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
         }
         await self._ws_send_json(payload)
 
-    async def send_audio(self, pcm_bytes: bytes) -> None:
+    def send(self, pcm_bytes: bytes) -> bool:
         """Forward a PCM16LE chunk as an ``input_audio_buffer.append`` event.
 
+        SYNC by contract (mirrors ``SafeDeepgramSocket.send``) — schedules the
+        async WS send onto the captured event loop and returns immediately.
+
+        Returns ``True`` if the send was scheduled, ``False`` if the session
+        is dead/closed or has not been connected yet. transcribe.py ignores
+        the return value, but unit tests assert on it.
+
         If a VAD gate is attached, audio is routed through it first — same
-        pattern Deepgram path uses (silence is gated out, finalize signals
-        are absorbed because server VAD owns turn closing on the Realtime
-        side).
+        pattern the Deepgram path uses (silence is gated out, finalize
+        signals are absorbed because server VAD owns turn closing on the
+        Realtime side).
         """
-        if self._dead or self._closed or self._ws is None:
-            return
+        if self._dead or self._closed or self._ws is None or self._loop is None:
+            return False
 
         # Allow callers to register their own activity gate (same shape as
         # ``connect_to_deepgram_with_backoff``'s ``is_active`` parameter).
         if self._is_active is not None and not self._is_active():
-            return
+            # Activity gate said skip — not a dead-connection condition; we
+            # report success so the caller doesn't latch us as dead.
+            return True
 
         audio_to_send = pcm_bytes
         if self._vad_gate is not None:
@@ -241,52 +294,118 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
                 audio_to_send = pcm_bytes
 
         if not audio_to_send:
-            return
+            return True
 
-        encoded = base64.b64encode(audio_to_send).decode('ascii')
-        event = {'type': 'input_audio_buffer.append', 'audio': encoded}
-        await self._ws_send_json(event)
+        # Schedule the async send fire-and-forget. We use
+        # run_coroutine_threadsafe so the wrapper is safe whether the caller
+        # is on self._loop or on a worker thread; either way we return
+        # without blocking the caller.
+        try:
+            asyncio.run_coroutine_threadsafe(self._async_send(audio_to_send), self._loop)
+        except RuntimeError as e:
+            # Loop closed mid-flight — latch as dead so transcribe.py stops sending.
+            if self._death_reason is None:
+                self._death_reason = f'send schedule failed: {e}'
+            self._dead = True
+            return False
+        return True
 
-    async def finalize(self) -> None:
+    def finalize(self) -> None:
         """NO-OP on the Realtime path.
 
-        Manual ``input_audio_buffer.commit`` triggers a server-side
-        AssertionError (T1 reprobe). Server VAD handles turn closing
-        based on ``silence_duration_ms=550`` (hardcoded build-level
-        default — silently ignored override).
+        SYNC by contract (mirrors ``SafeDeepgramSocket.finalize``). Manual
+        ``input_audio_buffer.commit`` triggers a server-side AssertionError
+        (T1 reprobe). Server VAD handles turn closing based on
+        ``silence_duration_ms=550`` (hardcoded build-level default — silently
+        ignored override). We intentionally do NOT send a commit event here.
         """
         return None
 
-    async def finish(self) -> None:
-        """Close the WS and cancel the reader task. Idempotent."""
+    def finish(self) -> None:
+        """Close the WS and cancel the reader task. SYNC; idempotent.
+
+        Schedules the async close onto the captured event loop fire-and-forget
+        (transcribe.py is shutting down and cannot await), and latches
+        ``is_connection_dead`` so any racing ``send`` call returns False.
+        """
         if self._closed:
             return
         self._closed = True
+        if self._death_reason is None:
+            self._death_reason = 'finish() called'
 
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if self._loop is None:
+            # connect() never completed — nothing to schedule.
             self._reader_task = None
-
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception:
-                logger.debug('Error closing Realtime WS', exc_info=True)
             self._ws = None
+            return
+
+        try:
+            asyncio.run_coroutine_threadsafe(self._async_finish(), self._loop)
+        except RuntimeError:
+            # Loop already closed — best-effort; nothing else we can do
+            # safely from a sync context.
+            logger.debug('Realtime WS finish skipped: event loop already closed', exc_info=True)
 
     # ----- internal helpers --------------------------------------------
 
+    async def _async_send(self, audio_bytes: bytes) -> None:
+        """Async worker invoked by the sync ``send`` wrapper.
+
+        Encodes the PCM chunk + dispatches the ``input_audio_buffer.append``
+        event over the WS. Latches ``_dead`` + records ``_death_reason`` on
+        any send failure so subsequent sync ``send`` calls short-circuit
+        to ``False``.
+        """
+        if self._dead or self._closed or self._ws is None:
+            return
+        try:
+            encoded = base64.b64encode(audio_bytes).decode('ascii')
+            event = {'type': 'input_audio_buffer.append', 'audio': encoded}
+            await self._ws.send(json.dumps(event))
+        except Exception as e:
+            if self._death_reason is None:
+                self._death_reason = f'send {type(e).__name__}: {e}'
+            logger.warning('Realtime WS send failed (%s: %s); marking dead', type(e).__name__, e)
+            self._dead = True
+
+    async def _async_finish(self) -> None:
+        """Async worker invoked by the sync ``finish`` wrapper.
+
+        Cancels the reader task and closes the WS. Best-effort: never raises
+        because the sync caller (transcribe.py shutdown path) has nowhere to
+        catch.
+        """
+        reader_task = self._reader_task
+        self._reader_task = None
+        if reader_task is not None:
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        ws = self._ws
+        self._ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                logger.debug('Error closing Realtime WS', exc_info=True)
+
     async def _ws_send_json(self, payload: dict) -> None:
-        """Send a JSON event over the WS, latching the connection on failure."""
+        """Send a JSON event over the WS, latching the connection on failure.
+
+        Used for control-plane events (session.update) that still run from
+        within ``connect()``'s async context.
+        """
         if self._ws is None:
             return
         try:
             await self._ws.send(json.dumps(payload))
         except Exception as e:
+            if self._death_reason is None:
+                self._death_reason = f'control-plane send {type(e).__name__}: {e}'
             logger.warning('Realtime WS send failed (%s: %s); marking dead', type(e).__name__, e)
             self._dead = True
 
@@ -307,6 +426,8 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if self._death_reason is None:
+                self._death_reason = f'reader terminated {type(e).__name__}: {e}'
             logger.warning('Realtime WS reader terminated: %s: %s', type(e).__name__, e)
             self._dead = True
 
@@ -372,6 +493,8 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
             # the WS on the v1.2-patched build, so we leave the connection
             # alive and let the next .completed fire normally.
             if 'connection' in msg.lower() or 'closed' in msg.lower():
+                if self._death_reason is None:
+                    self._death_reason = f'server error: {err_type}: {msg}'
                 self._dead = True
             return
 
@@ -486,8 +609,10 @@ class RealtimeApiStreamingProvider(STTStreamingProvider):
             logger.error('RealtimeApiStreamingProvider failed to open session: %s: %s', type(e).__name__, e)
             # Mirror connect_to_deepgram_with_backoff's None-on-failure path
             # so the caller in streaming.py can decide whether to fall back.
+            # finish() is now sync (fire-and-forget) — see SafeDeepgramSocket
+            # contract in streaming_provider.py.
             try:
-                await session.finish()
+                session.finish()
             except Exception:
                 pass
             return None
