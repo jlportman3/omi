@@ -37,6 +37,21 @@ Reprobe v1.2 section for the source-of-truth probe transcripts):
     from the Sortformer service at ``utils/stt/voice-extras:8094`` (same
     parallel pipeline as for Deepgram today). We emit ``SPEAKER_0`` as the
     placeholder.
+  * NEVER send ``conversation.item.create`` from the client. speaches owns
+    the item lifecycle — it auto-creates items via VAD with server-assigned
+    ``item_id`` values and pushes them through
+    ``conversation.item.created`` events. If we (or any retry/echo loop)
+    ever post a ``conversation.item.create`` with an existing id the
+    server emits a benign ``Error adding item: ... already exists`` event
+    that we recognize and demote in ``_handle_event``.
+  * Per-sample byte width: speaches expects int16 LE PCM samples in
+    ``input_audio_buffer.append``. The omi WS ``codec=pcm8`` Friend pendant
+    transmits int16 LE @ 16 kHz despite the legacy name (firmware emits
+    int16 from the PDM mic — verified empirically against the live audio
+    in GCS). The provider therefore treats ``sample_width=2`` as the
+    canonical input and only widens / narrows if a caller explicitly passes
+    ``sample_width=1`` (defensive, in case a future device codec carries
+    true int8 samples).
 """
 
 from __future__ import annotations
@@ -483,10 +498,21 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
             return
 
         if etype == 'error':
-            self._errors_seen += 1
             err = event.get('error', {})
             msg = err.get('message', '')
             err_type = err.get('type', '')
+            # Benign known speaches races we explicitly tolerate:
+            #   * "Error adding item: ... already exists" — speaches auto-creates
+            #     items via VAD; under load it occasionally tries to add the
+            #     same id twice on its own side. We never send
+            #     conversation.item.create from the client (verified by grep),
+            #     so this is purely server-side and harmless to our pipeline.
+            #     Demote to debug so it stops alarming operators and don't
+            #     increment _errors_seen (keeps the counter meaningful).
+            if err_type == 'invalid_request_error' and 'already exists' in msg:
+                logger.debug('Realtime API benign duplicate-item server race: %s', msg)
+                return
+            self._errors_seen += 1
             logger.warning('Realtime API error event type=%s message=%s', err_type, msg)
             # Only mark dead on connection-fatal errors. Benign
             # ``InternalServerError`` after a transcript turn does NOT close
