@@ -75,17 +75,28 @@ class StreamingTranscriptSession(ABC):
     """A long-lived push-bytes / emit-segments STT session.
 
     This is the contract ``routers/transcribe.py`` consumes today through
-    ``SafeDeepgramSocket`` / ``GatedDeepgramSocket``. Methods are named to
-    match the existing duck-typed surface so transcribe.py can swap providers
-    via the env var without source changes.
+    ``SafeDeepgramSocket`` / ``GatedDeepgramSocket``. Methods are named —
+    and intentionally **SYNC** — to match the existing duck-typed surface so
+    transcribe.py can swap providers via the env var without source changes.
+
+    Why sync, not async:
+        transcribe.py runs an async WebSocket handler but treats the STT
+        session as a sync object — it calls ``session.send(chunk)`` /
+        ``session.finish()`` without ``await`` (see lines 2452, 2793, 2797
+        in ``routers/transcribe.py``). ``SafeDeepgramSocket`` matches that
+        contract because the Deepgram SDK's ``LiveConnection.send`` is sync.
+        Any provider that needs async I/O internally MUST schedule it onto
+        the caller's event loop (e.g. via ``asyncio.run_coroutine_threadsafe``
+        or ``loop.create_task``) — do NOT change the public surface to
+        ``async`` without also rewriting transcribe.py.
 
     Lifecycle:
-        s = await provider.open_session(...)
+        s = await provider.open_session(...)   # async — opens transport
         while audio:
-            await s.send_audio(pcm_bytes)
+            s.send(pcm_bytes)                  # sync — returns True/False
             # provider invokes stream_transcript(...) as segments arrive
-        await s.finalize()  # idempotent; some providers no-op (server VAD)
-        await s.finish()
+        s.finalize()                           # sync; some providers no-op
+        s.finish()                             # sync — closes transport
     """
 
     @property
@@ -93,36 +104,48 @@ class StreamingTranscriptSession(ABC):
     def provider_name(self) -> str:
         """Short identifier — e.g. ``'deepgram'`` or ``'realtime-local'``."""
 
+    @property
     @abstractmethod
-    async def send_audio(self, pcm_bytes: bytes) -> None:
+    def is_connection_dead(self) -> bool:
+        """True once the underlying transport has been detected as dead.
+
+        One-way latch — once True, MUST never flip back to False. The caller
+        (transcribe.py:flush_stt_buffer) checks this before every ``send``
+        and stops forwarding audio when it goes True (see #5870).
+
+        Mirrors ``SafeDeepgramSocket.is_connection_dead``.
+        """
+
+    @abstractmethod
+    def send(self, pcm_bytes: bytes) -> bool:
         """Forward a PCM16LE chunk to the underlying transport.
 
-        Implementations SHOULD be silent on already-dead connections — the
-        caller does not check return values today (see
-        ``routers/transcribe.py`` audio-write path).
+        SYNC by contract — see class docstring. Returns ``True`` if the bytes
+        were scheduled / sent, ``False`` if the session is dead. Today's
+        caller (transcribe.py) ignores the return value, but tests assert on
+        it to catch dead-connection regressions early.
+
+        Implementations SHOULD be silent on already-dead connections — never
+        raise; just return ``False``.
         """
 
     @abstractmethod
-    async def finalize(self) -> None:
+    def finalize(self) -> None:
         """Flush any pending partial transcript.
 
-        For server-VAD providers (Realtime API on speaches) this is a NO-OP
-        because manual ``input_audio_buffer.commit`` triggers a server
-        AssertionError (spec, T1 reprobe). For Deepgram this maps to the
-        existing ``finalize()`` call on speech->silence transitions.
+        SYNC by contract. For server-VAD providers (Realtime API on speaches)
+        this is a NO-OP because manual ``input_audio_buffer.commit`` triggers
+        a server AssertionError (spec, T1 reprobe). For Deepgram this maps to
+        the existing ``finalize()`` call on speech->silence transitions.
         """
 
     @abstractmethod
-    async def finish(self) -> None:
-        """Close the underlying transport. MUST be idempotent."""
+    def finish(self) -> None:
+        """Close the underlying transport. SYNC by contract; MUST be idempotent.
 
-    @abstractmethod
-    def is_alive(self) -> bool:
-        """Return ``False`` once the connection has been detected as dead.
-
-        Implementations mirror today's ``SafeDeepgramSocket.is_connection_dead``
-        semantics (one-way latch). The caller may stop sending audio once this
-        returns ``False``.
+        Implementations that need async cleanup MUST schedule it onto the
+        caller's event loop and return — do NOT block waiting for completion
+        (transcribe.py is mid-shutdown and cannot await).
         """
 
 
