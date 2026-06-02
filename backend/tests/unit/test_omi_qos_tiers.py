@@ -59,7 +59,9 @@ class TestModelQosProfiles:
     """Verify profile structure and completeness."""
 
     def test_three_profiles_exist(self):
-        assert set(MODEL_QOS_PROFILES.keys()) == {'premium', 'max', 'byok'}
+        # 'local_only' was added for fully-local self-host deployments; it is
+        # opt-in via MODEL_QOS=local_only and never the default.
+        assert set(MODEL_QOS_PROFILES.keys()) == {'premium', 'max', 'byok', 'local_only'}
 
     def test_all_profiles_have_same_features(self):
         feature_sets = {name: set(profile.keys()) for name, profile in MODEL_QOS_PROFILES.items()}
@@ -76,7 +78,11 @@ class TestModelQosProfiles:
             providers = {provider for _model, provider in profile.values()}
             assert 'anthropic' in providers, f'{profile_name} missing Anthropic models'
             assert 'perplexity' in providers, f'{profile_name} missing Perplexity models'
-            assert 'openrouter' in providers, f'{profile_name} should have OpenRouter (wrapped_analysis)'
+        # OpenRouter must be present in every cloud-allowed profile (local_only
+        # intentionally drops OpenRouter to keep wrapped_analysis on local Qwen).
+        for name in ('premium', 'max', 'byok'):
+            providers = {p for _m, p in MODEL_QOS_PROFILES[name].values()}
+            assert 'openrouter' in providers, f'{name} should have OpenRouter (wrapped_analysis)'
         # OpenAI-based profiles must have OpenAI provider
         for name in ('premium', 'max', 'byok'):
             providers = {p for _m, p in MODEL_QOS_PROFILES[name].values()}
