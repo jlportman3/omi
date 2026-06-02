@@ -5,13 +5,18 @@ from typing import Dict
 
 import typesense
 
-client = typesense.Client(
-    {
-        'nodes': [{'host': os.getenv('TYPESENSE_HOST'), 'port': os.getenv('TYPESENSE_HOST_PORT'), 'protocol': 'https'}],
-        'api_key': os.getenv('TYPESENSE_API_KEY'),
-        'connection_timeout_seconds': 2,
-    }
-)
+if os.getenv('TYPESENSE_API_KEY'):
+    client = typesense.Client(
+        {
+            'nodes': [
+                {'host': os.getenv('TYPESENSE_HOST'), 'port': os.getenv('TYPESENSE_HOST_PORT'), 'protocol': 'https'}
+            ],
+            'api_key': os.getenv('TYPESENSE_API_KEY'),
+            'connection_timeout_seconds': 2,
+        }
+    )
+else:
+    client = None
 
 
 def search_conversations(
@@ -24,7 +29,6 @@ def search_conversations(
     end_date: int = None,
 ) -> Dict:
     try:
-
         filter_by = f'userId:={uid}'
         if not include_discarded:
             filter_by = filter_by + ' && discarded:=false'
