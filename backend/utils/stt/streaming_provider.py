@@ -161,13 +161,28 @@ class StreamingSessionConfig:
     Kept as a separate dataclass (rather than expanding ``open_session``'s
     positional signature) so future providers can add knobs without churning
     every caller. Today only ``vad_gate`` / ``is_active`` / ``keywords`` /
-    ``model`` are consumed; the rest are reserved.
+    ``model`` / ``sample_width`` are consumed; the rest are reserved.
+
+    ``sample_width`` is the *byte width* per audio sample as transmitted to
+    ``send()`` — i.e. 2 for int16 LE (the canonical omi pipeline format) and
+    1 for int8 (legacy / hypothetical 8-bit-source firmware). It is NOT the
+    same as the omi WS ``codec=`` query param: the Friend pendant connects
+    with ``?codec=pcm8&sample_rate=16000`` but the firmware actually emits
+    int16 LE @ 16 kHz — the "8" in ``pcm8`` historically referred to the
+    sample rate in kHz, not the bit depth (see codec mapping notes in
+    ``app/lib/backend/schema/bt_device/bt_device.dart``). Callers therefore
+    pass ``sample_width=2`` for both ``pcm8`` and ``pcm16``. Providers MAY
+    use this field to validate / convert formats defensively — e.g. the
+    realtime provider widens int8 → int16 LE before forwarding so a future
+    truly-8-bit codec wouldn't silently feed Whisper garbage and trigger
+    hallucinations on noise.
     """
 
     keywords: List[str] = field(default_factory=list)
     model: Optional[str] = None
     vad_gate: Optional[Any] = None  # utils.stt.vad_gate.VADStreamingGate
     is_active: Optional[Callable[[], bool]] = None
+    sample_width: int = 2  # bytes per sample as transmitted to send(); 2 = int16 LE
     extra: dict = field(default_factory=dict)
 
 
