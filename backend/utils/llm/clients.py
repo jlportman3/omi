@@ -168,9 +168,14 @@ def get_openai_chat(model: str, **kwargs) -> ChatOpenAI:
 # Global switch:     MODEL_QOS=premium        (selects entire profile)
 #
 # Profiles:
-#   premium  — maximize cost savings while preserving 80% of max quality
-#   max      — 100% quality, best models available, no cost optimization
-#   byok     — same models as max (BYOK users pay their own API costs)
+#   premium     — maximize cost savings while preserving 80% of max quality
+#   max         — 100% quality, best models available, no cost optimization
+#   byok        — same models as max (BYOK users pay their own API costs)
+#   local_only  — fully-local, zero third-party clouds (self-host only).
+#                 Routes every feature to a model hosted on the local LiteLLM
+#                 proxy (default OPENAI_BASE_URL=http://10.0.60.48:4000/v1).
+#                 Eliminates direct Gemini + OpenRouter cloud calls.
+#                 NOTE: web_search has no local equivalent — see profile entry.
 # ---------------------------------------------------------------------------
 
 MODEL_QOS_PROFILES: Dict[str, Dict[str, Tuple[str, str]]] = {
@@ -322,6 +327,86 @@ MODEL_QOS_PROFILES: Dict[str, Dict[str, Tuple[str, str]]] = {
         # OpenRouter
         'wrapped_analysis': ('gemini-3-flash-preview', 'openrouter'),
         # Perplexity
+        'web_search': ('sonar-pro', 'perplexity'),
+    },
+    # -----------------------------------------------------------------------
+    # local_only — fully-local, zero third-party clouds (self-host operators).
+    #
+    # Every feature routes to qwen3.6-35b-a3b on the local LiteLLM proxy
+    # (OPENAI_BASE_URL / ANTHROPIC_BASE_URL → http://10.0.60.48:4000).
+    # qwen3.6-35b-a3b is a 35B-A3B MoE (~3B active params) that handles
+    # classification, reasoning, structured output, chat, and code with
+    # sub-200ms first-token latency on rtx6000.
+    #
+    # CLOUD DEPENDENCIES ELIMINATED vs premium/max/byok:
+    #   - session_titles, followup, onboarding, app_integration, trends
+    #     (were direct Google Gemini API → now local Qwen via LiteLLM)
+    #   - wrapped_analysis (was direct OpenRouter → now local Qwen)
+    #
+    # STILL CLOUD (no local equivalent):
+    #   - web_search → sonar-pro on api.perplexity.ai. Operator must either
+    #     keep PERPLEXITY_API_KEY set or accept that web_search returns
+    #     errors. A future task will front Perplexica with a Perplexity-API
+    #     shim and add it to LiteLLM as 'sonar-local'.
+    #
+    # chat_agent stays on provider='anthropic' so the anthropic_client
+    # tool-use codepath is preserved. The LiteLLM Anthropic-compat endpoint
+    # at ANTHROPIC_BASE_URL serves qwen3.6-35b-a3b on /v1/messages, verified
+    # via curl probe (HTTP 200, sub-100ms).
+    # -----------------------------------------------------------------------
+    'local_only': {
+        # Conversation processing — all local Qwen via LiteLLM OpenAI-compat
+        'conv_action_items': ('qwen3.6-35b-a3b', 'openai'),
+        'conv_structure': ('qwen3.6-35b-a3b', 'openai'),
+        'conv_app_result': ('qwen3.6-35b-a3b', 'openai'),
+        'conv_app_select': ('qwen3.6-35b-a3b', 'openai'),
+        'conv_folder': ('qwen3.6-35b-a3b', 'openai'),
+        'conv_discard': ('qwen3.6-35b-a3b', 'openai'),
+        'daily_summary': ('qwen3.6-35b-a3b', 'openai'),
+        'daily_summary_simple': ('qwen3.6-35b-a3b', 'openai'),
+        'external_structure': ('qwen3.6-35b-a3b', 'openai'),
+        # Memories & knowledge
+        'memories': ('qwen3.6-35b-a3b', 'openai'),
+        'learnings': ('qwen3.6-35b-a3b', 'openai'),
+        'memory_conflict': ('qwen3.6-35b-a3b', 'openai'),
+        'memory_category': ('qwen3.6-35b-a3b', 'openai'),
+        'knowledge_graph': ('qwen3.6-35b-a3b', 'openai'),
+        # Chat
+        'chat_responses': ('qwen3.6-35b-a3b', 'openai'),
+        'chat_extraction': ('qwen3.6-35b-a3b', 'openai'),
+        'chat_graph': ('qwen3.6-35b-a3b', 'openai'),
+        # Was direct Gemini cloud in premium — now local Qwen
+        'session_titles': ('qwen3.6-35b-a3b', 'openai'),
+        # Features
+        'goals': ('qwen3.6-35b-a3b', 'openai'),
+        'goals_advice': ('qwen3.6-35b-a3b', 'openai'),
+        'notifications': ('qwen3.6-35b-a3b', 'openai'),
+        'proactive_notification': ('qwen3.6-35b-a3b', 'openai'),
+        # Was direct Gemini cloud in premium — now local Qwen
+        'followup': ('qwen3.6-35b-a3b', 'openai'),
+        'smart_glasses': ('qwen3.6-35b-a3b', 'openai'),
+        'openglass': ('qwen3.6-35b-a3b', 'openai'),
+        # Was direct Gemini cloud in premium — now local Qwen
+        'onboarding': ('qwen3.6-35b-a3b', 'openai'),
+        'app_generator': ('qwen3.6-35b-a3b', 'openai'),
+        # Was direct Gemini cloud in premium — now local Qwen
+        'app_integration': ('qwen3.6-35b-a3b', 'openai'),
+        'persona_clone': ('qwen3.6-35b-a3b', 'openai'),
+        # Was direct Gemini cloud in premium — now local Qwen
+        'trends': ('qwen3.6-35b-a3b', 'openai'),
+        # Anthropic — stays on anthropic provider so anthropic_client tool-use
+        # codepath is preserved. LiteLLM serves qwen3.6-35b-a3b on /v1/messages.
+        'chat_agent': ('qwen3.6-35b-a3b', 'anthropic'),
+        # Persona — A3B MoE is fast enough that the 'premium' tier distinction
+        # is irrelevant locally.
+        'persona_chat': ('qwen3.6-35b-a3b', 'openai'),
+        'persona_chat_premium': ('qwen3.6-35b-a3b', 'openai'),
+        # Was OpenRouter Gemini cloud — now local Qwen
+        'wrapped_analysis': ('qwen3.6-35b-a3b', 'openai'),
+        # Perplexity — NO LOCAL EQUIVALENT. Operators who want zero clouds
+        # must accept that web_search will fail until a sonar-local shim
+        # (Perplexica behind a Perplexity-API surface) is built and added
+        # to LiteLLM. Until then, leave PERPLEXITY_API_KEY set.
         'web_search': ('sonar-pro', 'perplexity'),
     },
 }
