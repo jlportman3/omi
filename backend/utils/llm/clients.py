@@ -14,6 +14,7 @@ import tiktoken
 
 from models.structured import Structured
 from utils.byok import get_byok_key
+from utils.llm.qwen_structured import QwenChatOpenAI
 from utils.llm.usage_tracker import get_usage_callback
 
 logger = logging.getLogger(__name__)
@@ -499,7 +500,16 @@ _llm_cache: Dict[tuple, Any] = {}
 
 
 def _get_or_create_openai_llm(model_name: str, streaming: bool = False) -> ChatOpenAI:
-    """Get or create a cached ChatOpenAI for an OpenAI model."""
+    """Get or create a cached ChatOpenAI for an OpenAI model.
+
+    Local Qwen-on-LiteLLM models get a ``QwenChatOpenAI`` subclass whose
+    ``with_structured_output`` injects the schema into the prompt and
+    strips markdown fences from the response. Qwen does not honor
+    ``response_format={'type':'json_schema','strict':true}`` enforcement
+    through LiteLLM — see ``utils/llm/qwen_structured.py``. OpenAI models
+    keep the stock ChatOpenAI behavior (their structured-output API works
+    correctly).
+    """
     key = (model_name, streaming, 'openai')
     if key not in _llm_cache:
         kwargs: Dict[str, Any] = {
@@ -512,7 +522,8 @@ def _get_or_create_openai_llm(model_name: str, streaming: bool = False) -> ChatO
         if streaming:
             kwargs['streaming'] = True
             kwargs['stream_options'] = {"include_usage": True}
-        _llm_cache[key] = ChatOpenAI(model=model_name, **kwargs)
+        cls = QwenChatOpenAI if model_name.startswith('qwen') else ChatOpenAI
+        _llm_cache[key] = cls(model=model_name, **kwargs)
     return _llm_cache[key]
 
 
