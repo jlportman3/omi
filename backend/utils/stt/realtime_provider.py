@@ -61,6 +61,7 @@ import base64
 import json
 import logging
 import os
+import string
 import time
 from typing import Any, Optional
 
@@ -88,6 +89,112 @@ DEFAULT_REALTIME_TRANSCRIPTION_MODEL = 'Systran/faster-whisper-large-v3'
 # transcription is ~10s end-to-end. We don't drive any client-side timer here;
 # this is just the documented expected upper bound for tests.
 EXPECTED_FINAL_LATENCY_SEC = 12.0
+
+
+# ---------------------------------------------------------------------------
+# Whisper hallucination filter — known-residue phrases.
+#
+# Whisper's training corpus contains lots of YouTube-style sign-offs ("Thank
+# you for watching.", "Don't forget to subscribe.", "[Music]") and short
+# polite filler ("Thank you.", "Bye!"). When the model is fed silence,
+# breathing, or mic noise it confabulates these. The DevKit recording for
+# conv 3deec0e8-87cf-48de-8ece-e6ab0a85f112 had several confirmed cases
+# (e.g. idx 3 'Thank you.', idx 16 'Thanks for watching!', idx 47
+# 'Thank you for watching. Thank you for watching.') — Joe confirmed only
+# the "Thank you." was a real hallucination; the other collapsed-timestamp
+# segments were REAL speech. So the filter is exact-phrase only, never
+# substring (avoids dropping real speech that happens to contain residue).
+#
+# Env override: REALTIME_HALLUCINATION_PHRASES, comma-separated. Empty
+# string explicitly disables the filter.
+# ---------------------------------------------------------------------------
+
+DEFAULT_HALLUCINATION_PHRASES = [
+    'Thank you.',
+    'Thanks.',
+    'Thank you for watching.',
+    'Thanks for watching.',
+    "Don't forget to subscribe.",
+    'Subscribe.',
+    'Bye.',
+    'Bye!',
+    'Bye bye.',
+    'Bye bye!',
+    'Goodbye.',
+    '[Music]',
+    'Music plays.',
+    'Music.',
+    '♪',
+    '...',
+    'You.',
+]
+
+# Punctuation set used by _normalize_phrase to strip leading/trailing
+# residue. ``string.punctuation`` covers ASCII punctuation; we add em/en
+# dash and ellipsis explicitly since the unicode variants are common in
+# Whisper output.
+_PHRASE_STRIP_CHARS = string.punctuation + '—–…' + ' \t\n\r'
+
+
+def _normalize_phrase(s: str) -> str:
+    """Normalize a phrase for hallucination comparison.
+
+    Applied identically to both the configured phrase set (at load time)
+    and to incoming transcript text (at filter time) so comparison is
+    symmetric.
+
+    Pipeline:
+      1. ``.strip()`` outer whitespace.
+      2. ``.lower()`` — case-insensitive match.
+      3. Strip leading + trailing punctuation (ASCII punct + em/en dash +
+         ellipsis + whitespace).
+      4. Collapse internal whitespace runs to a single space.
+
+    Examples:
+      ``"Thank you."`` -> ``"thank you"``
+      ``" THANK   YOU! "`` -> ``"thank you"``
+      ``"[Music]"`` -> ``"music"`` (brackets are punctuation)
+      ``"♪"`` -> ``"♪"`` (not stripped by string.punctuation)
+    """
+    s = s.strip().lower()
+    s = s.strip(_PHRASE_STRIP_CHARS)
+    return ' '.join(s.split())
+
+
+def _load_hallucination_phrases() -> set:
+    """Build the active hallucination phrase set from env + defaults.
+
+    ``REALTIME_HALLUCINATION_PHRASES`` unset/None -> defaults.
+    ``REALTIME_HALLUCINATION_PHRASES=""`` (explicit empty) -> filter disabled.
+    Otherwise comma-separated list replaces the defaults.
+    """
+    raw = os.getenv('REALTIME_HALLUCINATION_PHRASES')
+    if raw is None:
+        items = DEFAULT_HALLUCINATION_PHRASES
+    elif raw.strip() == '':
+        return set()
+    else:
+        items = raw.split(',')
+    return {_normalize_phrase(p) for p in items if p.strip()}
+
+
+# Module-level cache; tests can rebuild via _load_hallucination_phrases().
+_HALLUCINATION_PHRASES = _load_hallucination_phrases()
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    """True if ``text`` (after normalization) matches a known residue phrase.
+
+    Exact normalized-string match only — substring matching would drop
+    real speech that contains a residue phrase as part of a longer
+    utterance.
+    """
+    if not _HALLUCINATION_PHRASES:
+        return False
+    normalized = _normalize_phrase(text)
+    if not normalized:
+        return False
+    return normalized in _HALLUCINATION_PHRASES
 
 
 def _get_ws_url() -> str:
@@ -169,9 +276,28 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
         self._current_utterance_start: Optional[float] = None
         self._current_utterance_end: Optional[float] = None
 
+        # Previous utterance window — retained after emit so duplicate
+        # ``.completed`` events for the same item (a known speaches race
+        # under load) can reuse the real wall-clock timing instead of
+        # collapsing to start==end. ``_prev_item_id`` + ``_prev_text``
+        # guard against reusing the window for genuinely-new items that
+        # happen to also be missing VAD — only true duplicates (same
+        # item_id OR same text) get the reuse path.
+        self._prev_utterance_start: Optional[float] = None
+        self._prev_utterance_end: Optional[float] = None
+        self._prev_item_id: Optional[str] = None
+        self._prev_text: Optional[str] = None
+
+        # Monotonic floor for emitted segments. Used as a fallback when
+        # both wall-clock VAD events were missed and the event payload
+        # carries no usable duration — better than 0 for downstream
+        # speaker attribution.
+        self._last_emitted_end: Optional[float] = None
+
         # Counters for observability + tests.
         self._segments_emitted = 0
         self._errors_seen = 0
+        self._hallucinations_filtered = 0
 
     # ----- public API --------------------------------------------------
 
@@ -531,22 +657,109 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
 
         Times use the wall-clock anchor + per-utterance start/stop captured
         from the matching ``speech_started`` / ``speech_stopped`` events.
-        If the speech_started/stopped pair was missed (rare; first item on
-        connect), fall back to a 0-duration stamp at the current wall offset.
+        When those VAD events are missed (rare-but-real on speaches under
+        load — observed in conv 3deec0e8-87cf-48de-8ece-e6ab0a85f112 for
+        50% of segments) we apply a layered fallback so we never emit a
+        collapsed ``start==end`` stamp.
+
+        Also drops known-residue Whisper hallucinations BEFORE invoking
+        ``stream_transcript`` — see ``_HALLUCINATION_PHRASES``.
         """
         text = (event.get('transcript') or '').strip()
         if not text:
             return
 
+        # Drop known Whisper YouTube-residue hallucinations before any
+        # downstream call. Still reset the per-utterance window so the
+        # next real item starts clean.
+        if _is_whisper_hallucination(text):
+            self._hallucinations_filtered += 1
+            logger.debug(
+                'Realtime: dropping known-residue hallucination text=%r (normalized=%r)',
+                text,
+                _normalize_phrase(text),
+            )
+            # Cycle utterance windows so subsequent emits don't reuse
+            # stamps that may have been intended for this dropped item.
+            if self._current_utterance_start is not None or self._current_utterance_end is not None:
+                self._prev_utterance_start = self._current_utterance_start
+                self._prev_utterance_end = self._current_utterance_end
+                self._current_utterance_start = None
+                self._current_utterance_end = None
+            return
+
         now = time.time()
         anchor = self._wall_clock_open if self._wall_clock_open is not None else now
+        now_offset = max(0.0, now - anchor)
+
+        # Per-item audio_*_ms reset per item (T3 reprobe — cannot be used
+        # as absolute time), but they DO encode the duration of THIS turn.
+        # Use that to back-derive missing endpoints.
+        audio_start_ms = event.get('audio_start_ms')
+        audio_end_ms = event.get('audio_end_ms')
+        item_duration: Optional[float] = None
+        if (
+            isinstance(audio_start_ms, (int, float))
+            and isinstance(audio_end_ms, (int, float))
+            and audio_end_ms > audio_start_ms
+        ):
+            item_duration = (audio_end_ms - audio_start_ms) / 1000.0
 
         start = self._current_utterance_start
         end = self._current_utterance_end
-        if start is None:
-            start = max(0.0, now - anchor)
-        if end is None or end < start:
-            end = start
+
+        if start is None and end is None:
+            # Both VAD events missed (or this is a duplicate ``.completed``
+            # for an already-finalized item; the first emit reset the
+            # window). Only reuse the previous window when this looks like
+            # a true duplicate — same item_id OR identical text — so that
+            # genuinely-new items missing VAD still get fresh wall-clock
+            # anchoring instead of being clamped to the prior emit.
+            event_item_id = event.get('item_id')
+            is_duplicate = (
+                self._prev_utterance_start is not None
+                and self._prev_utterance_end is not None
+                and (
+                    (event_item_id is not None and event_item_id == self._prev_item_id)
+                    or (self._prev_text is not None and text == self._prev_text)
+                )
+            )
+            if is_duplicate:
+                start = self._prev_utterance_start
+                end = self._prev_utterance_end
+            else:
+                # True cold start (e.g. very first segment of session).
+                # Anchor end at now, back-derive start.
+                end = now_offset
+                if item_duration is not None:
+                    start = max(0.0, end - item_duration)
+                elif self._last_emitted_end is not None:
+                    # Use monotonic floor: previous emit's end becomes
+                    # this segment's start, clamped to keep end > start.
+                    start = min(self._last_emitted_end, end)
+                    if start >= end:
+                        start = max(0.0, end - 0.1)
+                else:
+                    start = max(0.0, end - 0.1)
+        elif end is None:
+            # Only ``speech_started`` fired.
+            if item_duration is not None:
+                end = start + item_duration
+            else:
+                end = max(start, now_offset)
+        elif start is None:
+            # Only ``speech_stopped`` fired.
+            if item_duration is not None:
+                start = max(0.0, end - item_duration)
+            else:
+                start = max(0.0, end - 0.1)
+
+        # Guarantee non-collapsed monotonic segment. 100ms placeholder is
+        # small enough to be ignored by Sortformer reassembly but big
+        # enough that downstream attribution doesn't flag the segment as
+        # anomalous.
+        if end <= start:
+            end = start + 0.1
 
         segment = StreamingSegment(
             speaker='SPEAKER_0',
@@ -557,12 +770,19 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
             person_id=None,
         )
 
-        # Reset per-utterance window so subsequent .completed events without
-        # a fresh speech_started don't reuse the same stamps.
+        # Cycle utterance windows: stash this item's window so a duplicate
+        # ``.completed`` (server re-emit under load) can reuse it instead
+        # of collapsing. Also remember item_id + text so the reuse path
+        # only fires for actual duplicates.
+        self._prev_utterance_start = start
+        self._prev_utterance_end = end
+        self._prev_item_id = event.get('item_id')
+        self._prev_text = text
         self._current_utterance_start = None
         self._current_utterance_end = None
 
         self._segments_emitted += 1
+        self._last_emitted_end = float(end)
 
         try:
             # transcribe.py's stream_transcript is a sync function. We call
@@ -648,4 +868,8 @@ class RealtimeApiStreamingProvider(STTStreamingProvider):
 __all__ = [
     'RealtimeApiStreamingProvider',
     'RealtimeStreamingSession',
+    'DEFAULT_HALLUCINATION_PHRASES',
+    '_normalize_phrase',
+    '_load_hallucination_phrases',
+    '_is_whisper_hallucination',
 ]
