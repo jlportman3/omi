@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import uuid
+from datetime import datetime, timezone
 from typing import List
 from firebase_admin import messaging, auth
 import database.notifications as notification_db
@@ -18,6 +19,7 @@ from .llm.notifications import (
     generate_credit_limit_notification,
     generate_silent_user_notification,
 )
+from .log_sanitizer import sanitize
 import logging
 
 logger = logging.getLogger(__name__)
@@ -448,6 +450,47 @@ def send_merge_completed_message(user_id: str, merged_conversation_id: str, remo
     }
     tag = _generate_tag(f"{user_id}:merge_completed:{merged_conversation_id}")
     _send_to_user(user_id, tag, data=data, is_background=True, priority='high')
+
+
+def send_force_wal_sync_message(user_id: str, reason: str = 'manual') -> int:
+    """
+    Sends a data-only FCM message asking the app to drain any pending WAL/SDCard
+    buffer the connected Friend pendant is holding, plus any phone-disk WALs.
+
+    Solves the "BLE-event-driven trigger" gap from omi pain-point cluster #2:
+    the Flutter app only auto-drains WAL on BLE-reconnect (firmware >= 3.0.17)
+    or via user-tapping the Process button on the Offline Sync page. There is
+    no network/connectivity-event-driven re-trigger, so a 5+ hour backlog can
+    sit indefinitely on the pendant's flash whenever the user notices the gap
+    after they've already opened the app at least once.
+
+    This helper produces the *server-side half* of the fix: a high-priority
+    silent push with type='trigger_wal_drain'. The app-side half (a handler
+    in NotificationServiceFCM.listenForMessages that calls
+    SyncProvider.syncWals on receipt) is required for this to do anything —
+    until that lands, this push is a no-op on the client.
+
+    Args:
+        user_id: The user's Firebase UID
+        reason: Free-form reason string included in the payload for debugging
+                (e.g. 'manual', 'admin_unblock', 'scheduled', 'connectivity_up').
+                Truncated to 64 chars for FCM 4KB ceiling safety.
+
+    Returns:
+        Number of FCM tokens the message was successfully delivered to.
+    """
+    logger.info(f'send_force_wal_sync_message to user {user_id} reason={sanitize(reason)}')
+    data = {
+        'type': 'trigger_wal_drain',
+        'reason': str(reason)[:64],
+        'requested_at': str(int(datetime.now(timezone.utc).timestamp())),
+    }
+    # Per-invocation nonce: do NOT collapse repeated unblock requests, because
+    # each one represents a fresh "phone please check the pendant" intent and a
+    # collapsed earlier one may have been delivered while the app was killed.
+    nonce = uuid.uuid4().hex[:8]
+    tag = _generate_tag(f"{user_id}:trigger_wal_drain:{nonce}")
+    return _send_to_user(user_id, tag, data=data, is_background=True, priority='high')
 
 
 def send_important_conversation_message(user_id: str, conversation_id: str):
