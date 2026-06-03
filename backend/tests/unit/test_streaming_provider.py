@@ -35,9 +35,14 @@ from utils.stt.streaming_provider import (
     STTStreamingProvider,
 )
 from utils.stt.realtime_provider import (
+    DEFAULT_HALLUCINATION_PHRASES,
     RealtimeApiStreamingProvider,
     RealtimeStreamingSession,
+    _is_whisper_hallucination,
+    _load_hallucination_phrases,
+    _normalize_phrase,
 )
+import utils.stt.realtime_provider as realtime_provider_module
 
 
 # ---------------------------------------------------------------------------
@@ -788,3 +793,469 @@ def test_realtime_provider_name():
         channels=1,
     )
     assert session.provider_name == 'realtime-local'
+
+
+# ---------------------------------------------------------------------------
+# Bug #1: wall-clock anchor collapse — regression tests covering the cases
+# observed in conv 3deec0e8-87cf-48de-8ece-e6ab0a85f112 where speaches
+# emitted ``.completed`` without firing the matching speech_started /
+# speech_stopped VAD events (50% of segments in that conv).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_anchor_fix_real_speech_zero_audio_ms(monkeypatch):
+    """``.completed`` arrives with no preceding VAD events. The fix must
+    NOT collapse the segment to ``start==end==0`` — that was the bug.
+    Without a usable ``audio_*_ms`` window we should still produce a
+    monotonic segment anchored at the current wall-clock offset."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    session = make_session(stream_transcript)
+
+    # Pin wall-clock so the math is deterministic.
+    wall_time = [100.0]
+
+    def fake_time():
+        return wall_time[0]
+
+    monkeypatch.setattr('utils.stt.realtime_provider.time.time', fake_time)
+    session._wall_clock_open = 100.0
+
+    # 5s after WS open, ``.completed`` arrives standalone — no
+    # speech_started / speech_stopped fired.
+    wall_time[0] = 105.0
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_cold',
+            'transcript': 'This is a test. This is only a test.',
+        }
+    )
+
+    assert len(captured) == 1
+    seg = captured[0][0]
+    # End anchored at the wall-clock offset (5s).
+    assert seg['end'] == pytest.approx(5.0)
+    # Start must be strictly less than end — the collapsed-segment bug
+    # would have produced start == end == 5.0.
+    assert seg['start'] < seg['end']
+    # No usable item duration, no previous emit -> 100ms placeholder window.
+    assert seg['end'] - seg['start'] == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_anchor_fix_uses_item_audio_ms_when_vad_missed(monkeypatch):
+    """When VAD events miss but the ``.completed`` event carries usable
+    ``audio_start_ms`` / ``audio_end_ms``, derive duration from those."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    session = make_session(stream_transcript)
+
+    wall_time = [100.0]
+
+    def fake_time():
+        return wall_time[0]
+
+    monkeypatch.setattr('utils.stt.realtime_provider.time.time', fake_time)
+    session._wall_clock_open = 100.0
+
+    wall_time[0] = 110.0
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_with_audio_ms',
+            'transcript': 'Meeting wireless internet service provider is for sale.',
+            'audio_start_ms': 0,
+            'audio_end_ms': 1500,
+        }
+    )
+
+    seg = captured[0][0]
+    # End anchored at now (10s); start = end - 1.5s.
+    assert seg['end'] == pytest.approx(10.0)
+    assert seg['start'] == pytest.approx(8.5)
+    assert seg['end'] - seg['start'] == pytest.approx(1.5)
+
+
+@pytest.mark.asyncio
+async def test_anchor_fix_subsequent_segments_use_wall_clock(monkeypatch):
+    """Three consecutive ``.completed`` events without VAD pairs should
+    each get monotonic, non-collapsed timestamps anchored to wall-clock."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    session = make_session(stream_transcript)
+
+    wall_time = [100.0]
+
+    def fake_time():
+        return wall_time[0]
+
+    monkeypatch.setattr('utils.stt.realtime_provider.time.time', fake_time)
+    session._wall_clock_open = 100.0
+
+    # Three turns, each separated by a few seconds.
+    for offset, text in ((103.0, 'turn one'), (108.0, 'turn two'), (115.0, 'turn three')):
+        wall_time[0] = offset
+        await session._handle_event(
+            {
+                'type': 'conversation.item.input_audio_transcription.completed',
+                'item_id': f'item_{offset}',
+                'transcript': text,
+            }
+        )
+
+    assert len(captured) == 3
+    segs = [c[0] for c in captured]
+    # Every segment is non-collapsed.
+    for seg in segs:
+        assert seg['end'] > seg['start']
+    # Ends are monotonically increasing.
+    assert segs[0]['end'] < segs[1]['end'] < segs[2]['end']
+    assert segs[0]['end'] == pytest.approx(3.0)
+    assert segs[1]['end'] == pytest.approx(8.0)
+    assert segs[2]['end'] == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_anchor_fix_duplicate_completed_reuses_prev_window(monkeypatch):
+    """Speaches occasionally re-emits ``.completed`` for an already-
+    finalized item. The first emit clears the per-utterance window; the
+    fix stashes it as ``_prev`` so the duplicate reuses real timing."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    session = make_session(stream_transcript)
+
+    wall_time = [100.0]
+
+    def fake_time():
+        return wall_time[0]
+
+    monkeypatch.setattr('utils.stt.realtime_provider.time.time', fake_time)
+    session._wall_clock_open = 100.0
+
+    # First emit: normal VAD pair -> 105.0..107.0.
+    wall_time[0] = 105.0
+    await session._handle_event({'type': 'input_audio_buffer.speech_started'})
+    wall_time[0] = 107.0
+    await session._handle_event({'type': 'input_audio_buffer.speech_stopped'})
+    wall_time[0] = 107.2
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_dup',
+            'transcript': 'duplicate me',
+        }
+    )
+
+    # Duplicate ``.completed`` for same item with same text — no fresh
+    # VAD events, no audio_*_ms.
+    wall_time[0] = 107.5
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_dup',
+            'transcript': 'duplicate me',
+        }
+    )
+
+    assert len(captured) == 2
+    first, second = captured[0][0], captured[1][0]
+    # Duplicate reuses the original window instead of collapsing.
+    assert second['start'] == pytest.approx(first['start'])
+    assert second['end'] == pytest.approx(first['end'])
+    assert second['end'] > second['start']
+
+
+@pytest.mark.asyncio
+async def test_anchor_fix_only_speech_started_uses_item_duration(monkeypatch):
+    """speech_started fires but speech_stopped is missed. With
+    audio_*_ms duration available, derive end = start + duration."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    session = make_session(stream_transcript)
+
+    wall_time = [100.0]
+
+    def fake_time():
+        return wall_time[0]
+
+    monkeypatch.setattr('utils.stt.realtime_provider.time.time', fake_time)
+    session._wall_clock_open = 100.0
+
+    wall_time[0] = 105.0
+    await session._handle_event({'type': 'input_audio_buffer.speech_started'})
+    # No speech_stopped.
+    wall_time[0] = 107.3
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_partial_vad',
+            'transcript': 'partial vad',
+            'audio_start_ms': 0,
+            'audio_end_ms': 2000,
+        }
+    )
+
+    seg = captured[0][0]
+    assert seg['start'] == pytest.approx(5.0)
+    assert seg['end'] == pytest.approx(7.0)
+
+
+# ---------------------------------------------------------------------------
+# Bug #2: Whisper YouTube-residue hallucination filter.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hallucination_filter_drops_thank_you(monkeypatch):
+    """``Thank you.`` is a textbook Whisper YouTube-residue hallucination
+    fed by silence/breathing. Must be dropped before stream_transcript."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    # Ensure default filter is active.
+    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+
+    session = make_session(stream_transcript)
+    session._wall_clock_open = 0.0
+
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_hallucination',
+            'transcript': 'Thank you.',
+        }
+    )
+
+    assert captured == []
+    assert session._hallucinations_filtered == 1
+
+
+@pytest.mark.asyncio
+async def test_hallucination_filter_drops_subscribe(monkeypatch):
+    """``Subscribe.`` is in the YouTube-residue default set."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+
+    session = make_session(stream_transcript)
+    session._wall_clock_open = 0.0
+
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_sub',
+            'transcript': 'Subscribe.',
+        }
+    )
+
+    assert captured == []
+    assert session._hallucinations_filtered == 1
+
+
+@pytest.mark.asyncio
+async def test_hallucination_filter_case_insensitive(monkeypatch):
+    """Case-insensitive: ``thank YOU.`` and ``THANK YOU!`` both drop."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+
+    session = make_session(stream_transcript)
+    session._wall_clock_open = 0.0
+
+    for text in ('thank you', 'THANK YOU.', 'Thank YOU!', '  Thank   you.  '):
+        await session._handle_event(
+            {
+                'type': 'conversation.item.input_audio_transcription.completed',
+                'item_id': 'item_case',
+                'transcript': text,
+            }
+        )
+
+    assert captured == []
+    assert session._hallucinations_filtered == 4
+
+
+@pytest.mark.asyncio
+async def test_hallucination_filter_keeps_real_speech(monkeypatch):
+    """Substring-only matching must NOT trigger. Real speech containing
+    residue phrases as part of a longer utterance must pass through."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+
+    session = make_session(stream_transcript)
+    session._wall_clock_open = 0.0
+
+    real_phrases = [
+        'Thank you very much for that pitch.',
+        'I want to subscribe to the streaming service.',
+        "Don't forget to subscribe to the newsletter next week.",
+        'Music plays an important role in our daily lives.',
+    ]
+    for text in real_phrases:
+        await session._handle_event(
+            {
+                'type': 'conversation.item.input_audio_transcription.completed',
+                'item_id': 'item_real',
+                'transcript': text,
+            }
+        )
+
+    assert len(captured) == len(real_phrases)
+    assert [c[0]['text'] for c in captured] == real_phrases
+    assert session._hallucinations_filtered == 0
+
+
+@pytest.mark.asyncio
+async def test_hallucination_filter_env_override(monkeypatch):
+    """``REALTIME_HALLUCINATION_PHRASES`` env var replaces the default set."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    monkeypatch.setenv('REALTIME_HALLUCINATION_PHRASES', 'Foo bar.,Baz!')
+    # Rebuild filter set under the env override.
+    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+
+    session = make_session(stream_transcript)
+    session._wall_clock_open = 0.0
+
+    # Old default phrase no longer in filter -> passes through.
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_old_default',
+            'transcript': 'Thank you.',
+        }
+    )
+    # New custom phrase -> dropped.
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_custom',
+            'transcript': 'Foo bar.',
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0][0]['text'] == 'Thank you.'
+    assert session._hallucinations_filtered == 1
+
+
+@pytest.mark.asyncio
+async def test_hallucination_filter_disabled_via_empty_env(monkeypatch):
+    """An explicit empty env value disables the filter entirely — every
+    residue phrase passes through."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    monkeypatch.setenv('REALTIME_HALLUCINATION_PHRASES', '')
+    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+
+    session = make_session(stream_transcript)
+    session._wall_clock_open = 0.0
+
+    await session._handle_event(
+        {
+            'type': 'conversation.item.input_audio_transcription.completed',
+            'item_id': 'item_disabled',
+            'transcript': 'Thank you.',
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0][0]['text'] == 'Thank you.'
+    assert session._hallucinations_filtered == 0
+
+
+@pytest.mark.asyncio
+async def test_session_counter_increments_on_filter_hit(monkeypatch):
+    """The ``_hallucinations_filtered`` counter is an observability hook —
+    must increment exactly once per dropped segment."""
+    captured: List[List[dict]] = []
+
+    def stream_transcript(segments):
+        captured.append(segments)
+
+    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+
+    session = make_session(stream_transcript)
+    session._wall_clock_open = 0.0
+
+    assert session._hallucinations_filtered == 0
+
+    for text in ('Thank you.', 'Bye!', 'Subscribe.', 'real speech here that survives'):
+        await session._handle_event(
+            {
+                'type': 'conversation.item.input_audio_transcription.completed',
+                'item_id': 'item_counter',
+                'transcript': text,
+            }
+        )
+
+    # Three hallucinations dropped, one real segment kept.
+    assert session._hallucinations_filtered == 3
+    assert len(captured) == 1
+    assert captured[0][0]['text'] == 'real speech here that survives'
+
+
+def test_normalize_phrase_strips_punctuation_and_case():
+    """``_normalize_phrase`` collapses whitespace + strips leading/trailing
+    punctuation + lowercases."""
+    assert _normalize_phrase('Thank you.') == 'thank you'
+    assert _normalize_phrase('  THANK   YOU! ') == 'thank you'
+    assert _normalize_phrase('[Music]') == 'music'
+    assert _normalize_phrase('...') == ''
+    # Unicode music note isn't ASCII punctuation -> preserved.
+    assert _normalize_phrase('♪') == '♪'
+
+
+def test_is_whisper_hallucination_exact_match_only(monkeypatch):
+    """Substring matches must NOT trigger. Only normalized exact match."""
+    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    assert _is_whisper_hallucination('Thank you.') is True
+    assert _is_whisper_hallucination('thank YOU') is True
+    # Substring containing the residue must not match.
+    assert _is_whisper_hallucination('Thank you for the great talk') is False
+    assert _is_whisper_hallucination('') is False
+
+
+def test_default_hallucination_phrases_contains_expected():
+    """Sanity check: the YouTube-residue baseline set covers Joe's
+    confirmed cases from conv 3deec0e8-87cf-48de-8ece-e6ab0a85f112."""
+    normalized = {_normalize_phrase(p) for p in DEFAULT_HALLUCINATION_PHRASES}
+    assert 'thank you' in normalized
+    assert 'thanks for watching' in normalized
+    assert 'subscribe' in normalized
+    assert 'music' in normalized
