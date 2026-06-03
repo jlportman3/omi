@@ -73,6 +73,7 @@ from utils.stt.speaker_embedding import (
     SPEAKER_MATCH_THRESHOLD,
 )
 from utils.subscription import has_transcription_credits
+from utils.notifications import send_force_wal_sync_message
 
 logger = logging.getLogger(__name__)
 
@@ -1013,7 +1014,6 @@ def process_segment(
             with lock:
                 response['new_memories'].add(created.id)
         else:
-
             transcript_segments = [s.dict() for s in transcript_segments]
 
             # assign timestamps to each segment
@@ -1698,3 +1698,55 @@ async def get_sync_job_status(job_id: str, uid: str = Depends(auth.get_current_u
             resp['error'] = job['error']
 
     return resp
+
+
+# ******************************************************
+# ******** FORCE WAL DRAIN (server-initiated) **********
+# ******************************************************
+#
+# Closes the BLE-event-driven trigger gap from omi pain-point cluster #2.
+# Sends a high-priority silent FCM data push asking the user's phone to ask
+# the connected Friend pendant to start draining any buffered WAL/SDCard
+# audio NOW, instead of waiting for the next BLE reconnect event.
+#
+# Read-only with respect to device state: the backend cannot reach the
+# pendant directly; it only nudges the phone. The phone must already be
+# online for the push to land. If the pendant is not currently BLE-paired,
+# the phone's handler can refuse (or schedule for next BLE reconnect) —
+# nothing here touches pendant flash.
+#
+# Requires a companion change on the app side: a 'trigger_wal_drain' branch
+# in NotificationServiceFCM.listenForMessages that invokes
+# SyncProvider.syncWals(). Without that handler, this endpoint is a no-op
+# on the client; it never produces a destructive action.
+
+
+@router.post("/v1/sync/force", tags=['v1'])
+async def force_wal_sync(
+    reason: str = Query('manual', description="Free-form reason for telemetry. Truncated to 64 chars."),
+    uid: str = Depends(auth.get_current_user_uid),
+):
+    """
+    Ask the user's app(s) to drain any pending Friend WAL backlog now.
+
+    Fires a high-priority data-only FCM push (`type=trigger_wal_drain`) to
+    every registered device of the authenticated user. The push carries no
+    payload that mutates device or server state — the app handler decides
+    whether to act (e.g. iff a Friend is currently BLE-paired and not
+    already syncing).
+
+    Returns 200 with `{'tokens_notified': N}` (N may be 0 if the user has no
+    registered FCM tokens — in that case the user must open the app to
+    re-register, after which they can call this endpoint again).
+    """
+    logger.info(f'force_wal_sync requested uid={uid} reason={sanitize(reason)}')
+    try:
+        notified = send_force_wal_sync_message(uid, reason=reason)
+    except Exception as e:
+        logger.error(f'force_wal_sync FCM dispatch failed uid={uid}: {sanitize(str(e))}')
+        raise HTTPException(status_code=502, detail="FCM dispatch failed")
+    return {
+        'status': 'dispatched',
+        'tokens_notified': notified,
+        'note': 'App must handle type=trigger_wal_drain to act. Pendant must be BLE-paired to drain flash.',
+    }
