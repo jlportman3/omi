@@ -9,7 +9,7 @@ from utils.executors import critical_executor, storage_executor
 
 logger = logging.getLogger(__name__)
 
-from langchain_core.output_parsers import PydanticOutputParser
+from utils.llm.qwen_structured import QwenPydanticOutputParser
 from pydantic import BaseModel, Field
 
 from .clients import get_llm
@@ -90,7 +90,7 @@ def extract_knowledge_from_memory(
     existing_nodes_json = json.dumps(existing_nodes_summary) if existing_nodes_summary else "None yet"
 
     try:
-        parser = PydanticOutputParser(pydantic_object=KnowledgeGraphExtraction)
+        parser = QwenPydanticOutputParser(pydantic_object=KnowledgeGraphExtraction)
         prompt = EXTRACTION_PROMPT.format(
             existing_nodes_json=existing_nodes_json,
             memory_content=memory_content,
@@ -187,7 +187,7 @@ def rebuild_knowledge_graph(uid: str, memories: List[Dict[str, Any]], user_name:
         existing_nodes_json = json.dumps(existing_nodes_summary) if existing_nodes_summary else "None yet"
 
         try:
-            parser = PydanticOutputParser(pydantic_object=KnowledgeGraphExtraction)
+            parser = QwenPydanticOutputParser(pydantic_object=KnowledgeGraphExtraction)
             prompt = EXTRACTION_PROMPT.format(
                 existing_nodes_json=existing_nodes_json,
                 memory_content=memory_content,
