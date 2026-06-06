@@ -7,7 +7,7 @@ import anthropic
 import httpx
 from cachetools import TTLCache
 from langchain_core.language_models import BaseChatModel
-from langchain_core.output_parsers import PydanticOutputParser
+from utils.llm.qwen_structured import QwenPydanticOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 import tiktoken
@@ -731,7 +731,7 @@ embeddings = _OpenAIEmbeddingsProxy(
     default=_embeddings_default,
     ctor_kwargs={},
 )
-parser = PydanticOutputParser(pydantic_object=Structured)
+parser = QwenPydanticOutputParser(pydantic_object=Structured)
 
 encoding = tiktoken.encoding_for_model('gpt-4')
 
