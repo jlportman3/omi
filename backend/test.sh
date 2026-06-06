@@ -117,6 +117,7 @@ pytest tests/unit/test_clean_sweep_migrations.py -v
 pytest tests/unit/test_omi_qos_tiers.py -v
 pytest tests/unit/test_llm_qos_profiles.py -v
 pytest tests/unit/test_chat_extraction.py -v
+pytest tests/unit/test_expected_output_fix.py -v
 pytest tests/unit/test_byok_security.py -v
 pytest tests/unit/test_paywall_reconnect_gate.py -v
 pytest tests/unit/test_trial_metadata.py -v
