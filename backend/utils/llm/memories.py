@@ -1,6 +1,6 @@
 from typing import List, Optional, Tuple
 
-from langchain_core.output_parsers import PydanticOutputParser
+from utils.llm.qwen_structured import QwenPydanticOutputParser
 from pydantic import BaseModel, Field
 
 from database import users as users_db
@@ -25,10 +25,16 @@ def _get_language_instruction(uid: str, language: Optional[str] = None) -> str:
 
 
 class Memories(BaseModel):
+    # max_items relaxed from 2 → 20 to fit local-LLM extraction behavior. Qwen
+    # consistently extracts the actual fact count (6-8 for rich conversations)
+    # and the prior cap rejected the entire response when exceeded — silently
+    # producing zero memories for every memory-rich conversation.
+    # See docstring on extract_memories_prompt for the per-conversation guidance
+    # that supersedes a hard schema cap.
     facts: List[Memory] = Field(
         min_items=0,
-        max_items=2,
-        description="List of **new** memories. Maximum 2 per conversation.",
+        max_items=20,
+        description="List of **new** memories extracted from this conversation.",
         default=[],
     )
 
@@ -80,7 +86,7 @@ def new_memories_extractor(
     language_instruction = _get_language_instruction(uid, language)
 
     try:
-        parser = PydanticOutputParser(pydantic_object=Memories)
+        parser = QwenPydanticOutputParser(pydantic_object=Memories)
         chain = extract_memories_prompt | get_llm('memories') | parser
         response: Memories = chain.invoke(
             {
@@ -121,7 +127,7 @@ def extract_memories_from_text(
     language_instruction = _get_language_instruction(uid, language)
 
     try:
-        parser = PydanticOutputParser(pydantic_object=MemoriesByTexts)
+        parser = QwenPydanticOutputParser(pydantic_object=MemoriesByTexts)
         chain = extract_memories_text_content_prompt | get_llm('memories') | parser
         response: Memories = chain.invoke(
             {
@@ -146,9 +152,10 @@ def extract_memories_from_text(
 
 
 class Learnings(BaseModel):
+    # max_items relaxed from 2 → 20 for the same reason as Memories above.
     result: List[str] = Field(
         min_items=0,
-        max_items=2,
+        max_items=20,
         description="List of **new** learnings. If any",
         default=[],
     )
@@ -173,7 +180,7 @@ def new_learnings_extractor(
     language_instruction = _get_language_instruction(uid, language)
 
     try:
-        parser = PydanticOutputParser(pydantic_object=Learnings)
+        parser = QwenPydanticOutputParser(pydantic_object=Learnings)
         chain = extract_learnings_prompt | get_llm('learnings') | parser
         response: Learnings = chain.invoke(
             {
@@ -293,7 +300,7 @@ EXAMPLES:
 Respond with the action and reasoning."""
 
     try:
-        parser = PydanticOutputParser(pydantic_object=MemoryResolution)
+        parser = QwenPydanticOutputParser(pydantic_object=MemoryResolution)
         chain = get_llm('memory_conflict') | parser
         response: MemoryResolution = chain.invoke(prompt + f"\n\n{parser.get_format_instructions()}")
         return response
