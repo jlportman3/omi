@@ -37,6 +37,7 @@ import re
 from typing import Any, Dict, List, Optional, Type, Union
 
 from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, ValidationError
@@ -413,3 +414,47 @@ class QwenChatOpenAI(ChatOpenAI):
             return _parse_qwen_structured_response(content or '', schema)
 
         return RunnableLambda(_run, afunc=_arun)
+
+
+class QwenPydanticOutputParser(PydanticOutputParser):
+    """``PydanticOutputParser`` subclass that tolerates Qwen-on-LiteLLM output.
+
+    The stock parser feeds the LLM's raw text directly to ``json.loads`` →
+    Pydantic. Qwen wraps its JSON in markdown ``` fences with a prose preamble
+    (same shape ``QwenChatOpenAI.with_structured_output`` strips above), and
+    also occasionally emits Title-Case keys for nested object fields. This
+    subclass mirrors both defenses for callers that use the legacy
+    ``prompt | llm | parser`` chain pattern (PydanticOutputParser bypasses
+    ``with_structured_output`` entirely).
+
+    Drop-in replacement: ``PydanticOutputParser(pydantic_object=Foo)`` →
+    ``QwenPydanticOutputParser(pydantic_object=Foo)``. No call-site changes
+    beyond the constructor name.
+
+    Affected call sites:
+      utils/llm/memories.py             (memories, learnings, memory_conflict)
+      utils/llm/knowledge_graph.py      (KnowledgeGraphExtraction)
+      utils/llm/conversation_processing.py (folder, discard, action_items, structure)
+      utils/llm/external_integrations.py  (external_structure)
+    """
+
+    def parse(self, text: str) -> BaseModel:  # type: ignore[override]
+        # 1. Strip markdown fences + prose preamble.
+        stripped = _strip_markdown_fences(text or '')
+        # 2. Defense-in-depth: try the stock parser first; on ValidationError,
+        #    retry with case-insensitive key normalization (same approach as
+        #    _parse_qwen_structured_response above).
+        try:
+            return super().parse(stripped)
+        except (ValidationError, json.JSONDecodeError):
+            # Re-parse the JSON payload, normalize keys via the schema's
+            # canonical key map, then validate. Failures bubble up to the
+            # caller exactly as before — no behavior change on success.
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                raise  # surface the original error
+            key_map = _build_key_map(self.pydantic_object)
+            canonical = _all_canonical_keys(key_map)
+            normalized = _normalize_keys(payload, canonical)
+            return self.pydantic_object.model_validate(normalized)
