@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Type, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableLambda
@@ -76,19 +76,124 @@ def _strip_markdown_fences(text: str) -> str:
     return stripped
 
 
+def _resolve_ref(spec: Dict[str, Any], defs: Dict[str, Any]) -> Dict[str, Any]:
+    """Follow a $ref like '#/$defs/Item' to its actual definition.
+
+    Pydantic v2 emits $refs for every nested BaseModel / Enum, so we have
+    to chase them to inspect the real shape. Returns the original spec
+    untouched when no $ref is present or the target is missing.
+    """
+    ref = spec.get('$ref')
+    if not ref or not ref.startswith('#/$defs/'):
+        return spec
+    name = ref.split('/', 2)[-1]
+    target = defs.get(name)
+    if target is None:
+        return spec
+    # Preserve outer description/title if the $ref entry had one
+    merged = dict(target)
+    if 'description' in spec and 'description' not in merged:
+        merged['description'] = spec['description']
+    return merged
+
+
+def _type_label(spec: Dict[str, Any], defs: Dict[str, Any]) -> str:
+    """Render a compact Python-style type label for a JSON-schema property.
+
+    Examples::
+
+        {"type": "string"}                      -> "str"
+        {"type": "array", "items": {"type":"string"}} -> "List[str]"
+        {"enum": ["a","b"]}                     -> "enum(a|b)"
+        {"type": "object"}                      -> "object"
+    """
+    spec = _resolve_ref(spec, defs)
+
+    if 'enum' in spec:
+        vals = '|'.join(str(v) for v in spec['enum'])
+        return f'enum({vals})'
+
+    py_type = spec.get('type', 'any')
+    if py_type == 'array':
+        item_spec = _resolve_ref(spec.get('items', {}) or {}, defs)
+        inner = _type_label(item_spec, defs)
+        return f'List[{inner}]'
+    if py_type == 'integer':
+        return 'int'
+    if py_type == 'number':
+        return 'float'
+    if py_type == 'string':
+        return 'str'
+    if py_type == 'boolean':
+        return 'bool'
+    if py_type == 'object':
+        return 'object'
+    return py_type
+
+
+def _emit_object_fields(
+    spec: Dict[str, Any],
+    defs: Dict[str, Any],
+    path_prefix: str,
+    lines: List[str],
+    visited: set,
+) -> None:
+    """Append "  \"<path>\": \"<type> — <desc>\"," lines for every field of an object spec.
+
+    Recurses into nested objects (whether referenced via $ref or inlined)
+    and into the element type of arrays-of-objects, emitting paths like
+    ``items[*].category`` so Qwen sees the exact key names it must use at
+    every level. ``visited`` guards against $ref cycles in self-referential
+    schemas.
+    """
+    spec = _resolve_ref(spec, defs)
+    title = spec.get('title')
+    if title:
+        if title in visited:
+            return
+        visited = visited | {title}
+
+    properties: Dict[str, Any] = spec.get('properties', {}) or {}
+    for name, raw_child in properties.items():
+        child = _resolve_ref(raw_child, defs)
+        label = _type_label(raw_child, defs)
+        # Prefer the outer (field-level) description over the referenced
+        # model's own title-block description.
+        desc = (raw_child.get('description') or child.get('description') or '').replace('\n', ' ').strip()
+
+        key_path = f'{path_prefix}.{name}' if path_prefix else name
+        if desc:
+            lines.append(f'  "{key_path}": "{label} — {desc}",')
+        else:
+            lines.append(f'  "{key_path}": "{label}",')
+
+        # Recurse into nested objects so Qwen sees the inner field names.
+        if child.get('type') == 'object' and child.get('properties'):
+            _emit_object_fields(child, defs, key_path, lines, visited)
+        elif child.get('type') == 'array':
+            item_spec = _resolve_ref(child.get('items', {}) or {}, defs)
+            if item_spec.get('type') == 'object' and item_spec.get('properties'):
+                _emit_object_fields(item_spec, defs, f'{key_path}[*]', lines, visited)
+
+
 def _schema_description(schema: Type[BaseModel]) -> str:
     """Build a compact human-readable schema block from a Pydantic class.
 
     Output looks like::
 
         {
-          "people": "List[str] — Identify all the people names ..."
-          "topics": "List[str] — List all the main topics ..."
-          ...
+          "items": "List[object] — List of items.",
+          "items[*].category": "enum(ceo|company|...) — The category identified",
+          "items[*].type": "enum(best|worst) — The sentiment identified",
+          "items[*].topic": "str — The specific topic corresponding the category"
         }
 
-    Qwen reliably mirrors this exact key set when this block is appended
-    to the prompt with explicit "match these keys" instructions.
+    The recursive form is required for Qwen to emit the right keys at every
+    level: when only the top-level properties are shown, Qwen invents its
+    own keys for the inner objects (e.g. ``Category`` / ``Type`` / ``Topic``
+    in title case) which then fail Pydantic validation. By giving it the
+    exact nested key paths and enum value lists, it reliably mirrors the
+    expected shape.
     """
     try:
         json_schema = schema.model_json_schema()
@@ -96,22 +201,79 @@ def _schema_description(schema: Type[BaseModel]) -> str:
         # Best-effort fallback — never block the call on schema inspection
         return ''
 
-    properties = json_schema.get('properties', {})
-    lines = ['{']
-    for name, spec in properties.items():
-        py_type = spec.get('type', 'any')
-        if py_type == 'array':
-            items = spec.get('items', {}).get('type', 'any')
-            py_type = f'List[{items}]'
-        desc = (spec.get('description') or '').replace('\n', ' ').strip()
-        if desc:
-            lines.append(f'  "{name}": "{py_type} — {desc}",')
-        else:
-            lines.append(f'  "{name}": "{py_type}",')
+    defs: Dict[str, Any] = json_schema.get('$defs', {}) or {}
+    lines: List[str] = ['{']
+    _emit_object_fields(json_schema, defs, '', lines, set())
     if len(lines) > 1:
         lines[-1] = lines[-1].rstrip(',')
     lines.append('}')
     return '\n'.join(lines)
+
+
+# Pydantic field names are case-sensitive but Qwen sometimes outputs Title-Case
+# keys (Category/Type/Topic) even when shown the exact lowercase schema. This
+# defense-in-depth pass normalizes object keys recursively so the resulting
+# JSON parses cleanly even when Qwen does not perfectly mirror the schema.
+def _build_key_map(schema: Type[BaseModel]) -> Dict[str, Dict[str, str]]:
+    """Return ``{model_title: {lowercase_key: canonical_key}}`` for every nested model.
+
+    Used by ``_normalize_keys`` to repair Qwen outputs where keys differ only
+    in case from the canonical Pydantic field names.
+    """
+    try:
+        json_schema = schema.model_json_schema()
+    except Exception:
+        return {}
+    defs: Dict[str, Any] = json_schema.get('$defs', {}) or {}
+    key_map: Dict[str, Dict[str, str]] = {}
+
+    def _walk(spec: Dict[str, Any]) -> None:
+        spec = _resolve_ref(spec, defs)
+        title = spec.get('title')
+        properties = spec.get('properties', {}) or {}
+        if title and properties and title not in key_map:
+            key_map[title] = {k.lower(): k for k in properties.keys()}
+        for child in properties.values():
+            resolved = _resolve_ref(child, defs)
+            if resolved.get('type') == 'object':
+                _walk(resolved)
+            elif resolved.get('type') == 'array':
+                _walk(resolved.get('items', {}) or {})
+
+    _walk(json_schema)
+    return key_map
+
+
+def _all_canonical_keys(key_map: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    """Flatten every nested model's lowercase→canonical map into one dict.
+
+    Different nested models in the same schema rarely use the same field
+    name with different casing, so a single flat map is enough and avoids
+    having to thread the model identity through every recursive call.
+    """
+    flat: Dict[str, str] = {}
+    for model_keys in key_map.values():
+        for low, canon in model_keys.items():
+            flat[low] = canon
+    return flat
+
+
+def _normalize_keys(payload: Any, canonical_keys: Dict[str, str]) -> Any:
+    """Recursively rename object keys to their canonical form (case-insensitive).
+
+    Walks dicts and lists. Unknown keys are passed through unchanged so the
+    Pydantic validator surfaces them as ``extra_forbidden`` only when the
+    model explicitly forbids extras — most omi models accept them.
+    """
+    if isinstance(payload, dict):
+        out: Dict[str, Any] = {}
+        for k, v in payload.items():
+            canon = canonical_keys.get(k.lower(), k) if isinstance(k, str) else k
+            out[canon] = _normalize_keys(v, canonical_keys)
+        return out
+    if isinstance(payload, list):
+        return [_normalize_keys(item, canonical_keys) for item in payload]
+    return payload
 
 
 def _augment_prompt_with_schema(prompt: Union[str, list], schema: Type[BaseModel]) -> Union[str, list]:
@@ -158,7 +320,19 @@ def _augment_prompt_with_schema(prompt: Union[str, list], schema: Type[BaseModel
 
 
 def _parse_qwen_structured_response(content: str, schema: Type[BaseModel]) -> BaseModel:
-    """Strip fences, json.loads, validate via Pydantic. Raises ValidationError on failure."""
+    """Strip fences, json.loads, normalize key casing, validate via Pydantic.
+
+    Two-stage validation:
+      1. First attempt uses the raw payload — fastest path when Qwen mirrors
+         the schema exactly (most calls).
+      2. On ValidationError, we rebuild the payload with case-insensitive key
+         normalization against every nested model in the schema and re-validate.
+
+    This recovers gracefully from the observed Qwen failure mode where, even
+    when shown the exact schema, it emits Title-Case keys for nested objects
+    (``{"Category": "company", "Type": "best", "Topic": "Tesla"}`` instead of
+    the required ``{"category", "type", "topic"}``).
+    """
     cleaned = _strip_markdown_fences(content or '')
     try:
         payload = json.loads(cleaned)
@@ -176,7 +350,14 @@ def _parse_qwen_structured_response(content: str, schema: Type[BaseModel]) -> Ba
                 }
             ],
         ) from exc
-    return schema.model_validate(payload)
+    try:
+        return schema.model_validate(payload)
+    except ValidationError:
+        key_map = _build_key_map(schema)
+        if not key_map:
+            raise
+        normalized = _normalize_keys(payload, _all_canonical_keys(key_map))
+        return schema.model_validate(normalized)
 
 
 class QwenChatOpenAI(ChatOpenAI):
