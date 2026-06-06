@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
-from langchain_core.output_parsers import PydanticOutputParser
+from utils.llm.qwen_structured import QwenPydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
@@ -118,7 +118,7 @@ Provide:
 
 {format_instructions}'''
 
-    folder_parser = PydanticOutputParser(pydantic_object=FolderAssignment)
+    folder_parser = QwenPydanticOutputParser(pydantic_object=FolderAssignment)
     # LiteLLM/Mistral 400s on system-only prompts ("No user query found in messages");
     # render as a single user message so the request is always accepted.
     prompt = ChatPromptTemplate.from_messages([('user', prompt_text)])
@@ -198,7 +198,7 @@ def should_discard_conversation(
                 "Generic filler words, acknowledgments, or incomplete thoughts in short conversations should be discarded."
             )
 
-    custom_parser = PydanticOutputParser(pydantic_object=DiscardConversation)
+    custom_parser = QwenPydanticOutputParser(pydantic_object=DiscardConversation)
     prompt = ChatPromptTemplate.from_messages(
         [
             '''You will receive a transcript, a series of photo descriptions from a wearable camera, or both. Your task is to decide if this content is meaningful enough to be saved as a memory.
@@ -532,7 +532,7 @@ def extract_action_items(
     ).strip()
 
     response_language = output_language_code or language_code
-    action_items_parser = PydanticOutputParser(pydantic_object=ActionItemsExtraction)
+    action_items_parser = QwenPydanticOutputParser(pydantic_object=ActionItemsExtraction)
     # The context message becomes the user turn so LiteLLM/Mistral sees at least
     # one non-system message ("No user query found in messages" otherwise 400s).
     context_message = 'The content language is {language_code}. You MUST respond entirely in {response_language}.\n\nContent:\n{conversation_context}{existing_items_context}'
