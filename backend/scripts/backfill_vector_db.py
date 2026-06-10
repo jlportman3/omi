@@ -69,6 +69,16 @@ VALID_TARGETS = ALL_TARGETS + ['screen_activity', 'all']
 
 PROGRESS_EVERY = 500
 BATCH_SIZE = 100  # embed + upsert this many per LiteLLM/Qdrant round-trip
+CONV_BATCH_SIZE = 25  # conversations carry full transcripts → much larger per-text
+# payload than one-line memories/action_items; a batch of 100
+# full transcripts timed out the embedding client (4 batches /
+# 400 convs lost on the first full run). 25 keeps each request
+# under the timeout.
+CONV_TEXT_MAX_CHARS = 8000  # cap per-conversation embed input. title+overview+leading
+# transcript is the signal-dense part for semantic conv
+# search; trailing transcript is mostly noise and bloats
+# the request. ~8k chars ≈ 2k tokens, well under the
+# 8191-token model limit even batched.
 PAGE_SIZE = 1000  # Firestore docs fetched per cursor page
 
 
@@ -200,7 +210,13 @@ def _conversation_text(conv: Dict) -> str:
     if segments:
         seg_texts = [s.get('text', '') for s in segments if isinstance(s, dict)]
         parts.extend([t for t in seg_texts if t])
-    return '\n'.join(parts).strip()
+    text = '\n'.join(parts).strip()
+    # Cap to bound per-text embed payload (title+overview+leading transcript is the
+    # retrieval-relevant part; trailing transcript bloats the request and caused
+    # batch timeouts). See CONV_TEXT_MAX_CHARS note.
+    if len(text) > CONV_TEXT_MAX_CHARS:
+        text = text[:CONV_TEXT_MAX_CHARS]
+    return text
 
 
 def backfill_conversations(uid: str, limit: int = None, dry_run: bool = False) -> Dict[str, int]:
@@ -223,28 +239,42 @@ def backfill_conversations(uid: str, limit: int = None, dry_run: bool = False) -
                 metadata[key] = val
         work.append({'id': conv['id'], 'text': text, 'metadata': metadata})
 
-    # 2. Batch-embed + upsert. One LiteLLM call per BATCH_SIZE texts instead of
-    #    one call per conversation — turns ~6k sequential round-trips into ~60.
-    for i in range(0, len(work), BATCH_SIZE):
-        batch = work[i : i + BATCH_SIZE]
+    # 2. Batch-embed + upsert. Conversations use a smaller batch (CONV_BATCH_SIZE)
+    #    because each text carries a full transcript; a batch of 100 timed out the
+    #    embedding client on the first run. One retry on transient failure before
+    #    counting the batch as errored.
+    for i in range(0, len(work), CONV_BATCH_SIZE):
+        batch = work[i : i + CONV_BATCH_SIZE]
         if dry_run:
             stats['written'] += len(batch)
         else:
-            try:
-                vectors = _embeddings.embed_documents([w['text'] for w in batch])
-                for w, vec in zip(batch, vectors):
-                    vector_db.upsert_vector2(uid, w['id'], vec, w['metadata'])
-                    stats['written'] += 1
-            except Exception as e:
-                stats['errors'] += len(batch)
-                logger.error(
-                    f'conversation batch embed/upsert failed uid={sanitize_pii(uid)} '
-                    f'batch_start={i} size={len(batch)}: {sanitize(str(e))}'
-                )
-        if (i // BATCH_SIZE) % 5 == 0:
+            ok = False
+            for attempt in (1, 2):
+                try:
+                    vectors = _embeddings.embed_documents([w['text'] for w in batch])
+                    for w, vec in zip(batch, vectors):
+                        vector_db.upsert_vector2(uid, w['id'], vec, w['metadata'])
+                        stats['written'] += 1
+                    ok = True
+                    break
+                except Exception as e:
+                    if attempt == 1:
+                        logger.warning(
+                            f'conversation batch retry uid={sanitize_pii(uid)} '
+                            f'batch_start={i} size={len(batch)}: {sanitize(str(e))}'
+                        )
+                        time.sleep(2.0)
+                        continue
+                    stats['errors'] += len(batch)
+                    logger.error(
+                        f'conversation batch embed/upsert failed uid={sanitize_pii(uid)} '
+                        f'batch_start={i} size={len(batch)}: {sanitize(str(e))}'
+                    )
+            del ok
+        if (i // CONV_BATCH_SIZE) % 20 == 0:
             logger.info(
                 f'conversations progress uid={sanitize_pii(uid)} '
-                f'processed={min(i + BATCH_SIZE, len(work))}/{len(work)}'
+                f'processed={min(i + CONV_BATCH_SIZE, len(work))}/{len(work)}'
             )
     return stats
 
