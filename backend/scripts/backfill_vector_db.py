@@ -29,7 +29,7 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, Iterable, List
+from typing import Dict, List
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -67,23 +67,46 @@ ACTION_ITEMS_COLLECTION = 'action_items'
 ALL_TARGETS = ['conversations', 'memories', 'action_items']
 VALID_TARGETS = ALL_TARGETS + ['screen_activity', 'all']
 
-PROGRESS_EVERY = 50
-BATCH_SIZE = 50  # for batch upserts where supported
+PROGRESS_EVERY = 500
+BATCH_SIZE = 100  # embed + upsert this many per LiteLLM/Qdrant round-trip
+PAGE_SIZE = 1000  # Firestore docs fetched per cursor page
 
 
 # ---------------------------------------------------------------------------
-# Firestore iterators
+# Firestore reader
 # ---------------------------------------------------------------------------
 
 
-def _iter_user_collection(uid: str, name: str, limit: int = None) -> Iterable[Dict]:
+def _read_all_docs(uid: str, name: str, limit: int = None) -> List[Dict]:
+    """Materialize all docs for a user collection, paginating by document id.
+
+    CRITICAL: we read each page into memory and CLOSE the cursor before doing
+    any slow per-item work (embedding/upsert). The earlier implementation held
+    a single ``col.stream()`` generator open across the whole collection while
+    embedding inline — Firestore's server-side stream deadline (~60s) then
+    fired a ``504 Deadline Exceeded`` partway through large collections. Paging
+    keeps every cursor short-lived.
+    """
     col = db.collection('users').document(uid).collection(name)
-    if limit:
-        col = col.limit(limit)
-    for doc in col.stream():
-        data = doc.to_dict() or {}
-        data['id'] = doc.id
-        yield data
+    out: List[Dict] = []
+    cursor = None
+    while True:
+        q = col.order_by('__name__').limit(PAGE_SIZE)
+        if cursor is not None:
+            q = q.start_after(cursor)
+        snaps = list(q.stream())  # cursor open only for this fast read
+        if not snaps:
+            break
+        for snap in snaps:
+            data = snap.to_dict() or {}
+            data['id'] = snap.id
+            out.append(data)
+            if limit and len(out) >= limit:
+                return out
+        if len(snaps) < PAGE_SIZE:
+            break
+        cursor = snaps[-1]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -91,15 +114,10 @@ def _iter_user_collection(uid: str, name: str, limit: int = None) -> Iterable[Di
 # ---------------------------------------------------------------------------
 
 
-def _embed_text(text: str) -> List[float]:
-    # The runtime embeddings proxy already routes to LiteLLM via OPENAI_BASE_URL.
-    return _embeddings.embed_query(text)
-
-
 def backfill_memories(uid: str, limit: int = None, dry_run: bool = False) -> Dict[str, int]:
     stats = {'total': 0, 'written': 0, 'skipped': 0, 'errors': 0}
     buf: List[Dict] = []
-    for memory in _iter_user_collection(uid, MEMORIES_COLLECTION, limit=limit):
+    for memory in _read_all_docs(uid, MEMORIES_COLLECTION, limit=limit):
         stats['total'] += 1
         content = memory.get('content') or ''
         if not content.strip():
@@ -135,7 +153,7 @@ def _flush_memories(uid: str, buf: List[Dict], dry_run: bool) -> int:
 def backfill_action_items(uid: str, limit: int = None, dry_run: bool = False) -> Dict[str, int]:
     stats = {'total': 0, 'written': 0, 'skipped': 0, 'errors': 0}
     buf: List[Dict] = []
-    for ai in _iter_user_collection(uid, ACTION_ITEMS_COLLECTION, limit=limit):
+    for ai in _read_all_docs(uid, ACTION_ITEMS_COLLECTION, limit=limit):
         stats['total'] += 1
         desc = ai.get('description') or ai.get('text') or ''
         if not desc.strip():
@@ -187,32 +205,47 @@ def _conversation_text(conv: Dict) -> str:
 
 def backfill_conversations(uid: str, limit: int = None, dry_run: bool = False) -> Dict[str, int]:
     stats = {'total': 0, 'written': 0, 'skipped': 0, 'errors': 0}
-    for conv in _iter_user_collection(uid, CONVERSATIONS_COLLECTION, limit=limit):
+
+    # 1. Build the work list from a fully-materialized read (no Firestore cursor
+    #    held open during the slow embed step that follows).
+    work: List[Dict] = []  # [{id, text, metadata}, ...]
+    for conv in _read_all_docs(uid, CONVERSATIONS_COLLECTION, limit=limit):
         stats['total'] += 1
         text = _conversation_text(conv)
         if not text:
             stats['skipped'] += 1
             continue
-        try:
-            if dry_run:
-                stats['written'] += 1
-            else:
-                vec = _embed_text(text)
-                metadata = {}
-                structured = conv.get('structured') or {}
-                for key in ('topics', 'entities', 'people', 'dates'):
-                    val = structured.get(key)
-                    if val:
-                        metadata[key] = val
-                vector_db.upsert_vector2(uid, conv['id'], vec, metadata)
-                stats['written'] += 1
-        except Exception as e:
-            stats['errors'] += 1
-            logger.error(f'conversation embed/upsert failed cid={conv["id"]}: {sanitize(str(e))}')
-        if stats['total'] % PROGRESS_EVERY == 0:
-            logger.info(f'conversations progress uid={sanitize_pii(uid)} processed={stats["total"]}')
-            # Throttle a touch so we don't pin LiteLLM at 100% during big backfills.
-            time.sleep(0.1)
+        metadata: Dict = {}
+        structured = conv.get('structured') or {}
+        for key in ('topics', 'entities', 'people', 'dates'):
+            val = structured.get(key)
+            if val:
+                metadata[key] = val
+        work.append({'id': conv['id'], 'text': text, 'metadata': metadata})
+
+    # 2. Batch-embed + upsert. One LiteLLM call per BATCH_SIZE texts instead of
+    #    one call per conversation — turns ~6k sequential round-trips into ~60.
+    for i in range(0, len(work), BATCH_SIZE):
+        batch = work[i : i + BATCH_SIZE]
+        if dry_run:
+            stats['written'] += len(batch)
+        else:
+            try:
+                vectors = _embeddings.embed_documents([w['text'] for w in batch])
+                for w, vec in zip(batch, vectors):
+                    vector_db.upsert_vector2(uid, w['id'], vec, w['metadata'])
+                    stats['written'] += 1
+            except Exception as e:
+                stats['errors'] += len(batch)
+                logger.error(
+                    f'conversation batch embed/upsert failed uid={sanitize_pii(uid)} '
+                    f'batch_start={i} size={len(batch)}: {sanitize(str(e))}'
+                )
+        if (i // BATCH_SIZE) % 5 == 0:
+            logger.info(
+                f'conversations progress uid={sanitize_pii(uid)} '
+                f'processed={min(i + BATCH_SIZE, len(work))}/{len(work)}'
+            )
     return stats
 
 
