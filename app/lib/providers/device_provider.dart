@@ -67,6 +67,14 @@ class DeviceProvider extends ChangeNotifier implements IDeviceServiceSubsciption
   final Debouncer _disconnectDebouncer = Debouncer(delay: const Duration(milliseconds: 500));
   final Debouncer _connectDebouncer = Debouncer(delay: const Duration(milliseconds: 100));
 
+  // Auto phone-mic fallback grace window. There is no Dart-side "reconnect
+  // exhausted" signal — native BLE auto-reconnects indefinitely with no counter.
+  // After a disconnect we wait this long; if the device hasn't come back (and is
+  // still paired-but-unavailable) we treat reconnect as exhausted and fall back
+  // to the phone mic. A reconnect within the window cancels this timer.
+  static const Duration _phoneMicFallbackGracePeriod = Duration(seconds: 25);
+  Timer? _phoneMicFallbackTimer;
+
   void Function(BtDevice device)? onDeviceConnected;
   void Function(BtDevice device, int fileCount, int totalBytes)? onOfflineDataDetected;
 
@@ -367,6 +375,7 @@ class DeviceProvider extends ChangeNotifier implements IDeviceServiceSubsciption
     _discoveryTimer?.cancel();
     _disconnectDebouncer.cancel();
     _connectDebouncer.cancel();
+    _phoneMicFallbackTimer?.cancel();
     ServiceManager.instance().device.unsubscribe(this);
     super.dispose();
   }
@@ -384,6 +393,12 @@ class DeviceProvider extends ChangeNotifier implements IDeviceServiceSubsciption
 
     captureProvider?.updateRecordingDevice(null);
 
+    // Auto phone-mic fallback: arm the grace timer. Native keeps trying to
+    // reconnect during this window; if it succeeds, the connected path cancels
+    // this timer. If it lapses with the device still unavailable but paired,
+    // we treat reconnect as exhausted and start phone-mic capture.
+    _armPhoneMicFallbackTimer();
+
     // Wals
     ServiceManager.instance().wal.getSyncs().sdcard.setDevice(null);
     ServiceManager.instance().wal.getSyncs().flashPage.setDevice(null);
@@ -397,6 +412,31 @@ class DeviceProvider extends ChangeNotifier implements IDeviceServiceSubsciption
       deviceType: 'omi',
       isConnected: false,
     );
+  }
+
+  /// Arms the grace timer that triggers auto phone-mic fallback once native
+  /// reconnect is treated as exhausted. Only arms when a device is actually
+  /// paired (so onboarding / no-device states are unaffected). Gate on the flag
+  /// up front too, so the timer never even arms when the feature is off.
+  void _armPhoneMicFallbackTimer() {
+    _phoneMicFallbackTimer?.cancel();
+    if (!SharedPreferencesUtil().autoPhoneMicFallback) return;
+    // Only a paired-but-unavailable device should fall back to the phone mic.
+    if (SharedPreferencesUtil().btDevice.id.isEmpty) return;
+
+    _phoneMicFallbackTimer = Timer(_phoneMicFallbackGracePeriod, () async {
+      // Re-check on expiry: still disconnected, no live device, but still paired.
+      final stillPaired = SharedPreferencesUtil().btDevice.id.isNotEmpty;
+      if (!isConnected && connectedDevice == null && stillPaired) {
+        Logger.debug('DeviceProvider: phone-mic fallback grace lapsed, device still unavailable -> starting fallback');
+        await captureProvider?.startPhoneMicFallback();
+      }
+    });
+  }
+
+  void _cancelPhoneMicFallbackTimer() {
+    _phoneMicFallbackTimer?.cancel();
+    _phoneMicFallbackTimer = null;
   }
 
   Future<(String, bool, String, Map)> shouldUpdateFirmware() async {
@@ -449,6 +489,14 @@ class DeviceProvider extends ChangeNotifier implements IDeviceServiceSubsciption
       _hasLowBatteryAlerted = false;
     }
     updateConnectingStatus(false);
+
+    // Auto phone-mic fallback hand-back: cancel any pending grace timer, then
+    // tear down an auto-started phone-mic session (no-op if none / if it was a
+    // user-initiated session) BEFORE resuming device capture so the two never
+    // run simultaneously.
+    _cancelPhoneMicFallbackTimer();
+    await captureProvider?.stopPhoneMicFallback();
+
     await captureProvider?.streamDeviceRecording(device: device);
 
     await getDeviceInfo();
@@ -692,6 +740,9 @@ class DeviceProvider extends ChangeNotifier implements IDeviceServiceSubsciption
     switch (state) {
       case DeviceConnectionState.connected:
         _disconnectDebouncer.cancel();
+        // Reconnect arrived — cancel any pending phone-mic fallback so it never
+        // fires right as the device returns (single-_activeSource invariant).
+        _cancelPhoneMicFallbackTimer();
         _connectDebouncer.run(() => _handleDeviceConnected(deviceId));
         break;
       case DeviceConnectionState.connecting:
