@@ -312,6 +312,14 @@ class SharedPreferencesUtil {
 
   set autoRecordingEnabled(bool value) => saveBool('autoRecordingEnabled', value);
 
+  // Auto phone-mic fallback: when a paired omi device becomes unavailable and
+  // native auto-reconnect has had its grace window, start capturing from the
+  // phone microphone so recording never silently stops. Hands capture back to
+  // the device when it reconnects. Defaults TRUE; no user-facing UI yet.
+  bool get autoPhoneMicFallback => getBool('autoPhoneMicFallback', defaultValue: true);
+
+  set autoPhoneMicFallback(bool value) => saveBool('autoPhoneMicFallback', value);
+
   // Developer Diagnostics
   bool get devLogsToFileEnabled => getBool('devLogsToFileEnabled');
 
