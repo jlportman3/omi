@@ -111,6 +111,13 @@ class CaptureProvider extends ChangeNotifier
   // Phone mic WAL: buffer for splitting variable-sized PCM chunks into fixed-size frames
   bool _phoneMicWalActive = false;
 
+  // True only when the CURRENT phone-mic session was auto-started by the
+  // device-unavailable fallback (DeviceProvider). Lets hand-back tear down a
+  // fallback session without touching a user-initiated "Record with Phone"
+  // session. Never set for manual streamRecording() calls.
+  bool _phoneMicFallbackActive = false;
+  bool get isPhoneMicFallbackActive => _phoneMicFallbackActive;
+
   bool _isLoadingInProgressConversation = false;
 
   // BLE streaming metrics
@@ -1115,6 +1122,9 @@ class CaptureProvider extends ChangeNotifier
   }
 
   stopStreamRecording() async {
+    // Any teardown clears the fallback marker so a stale flag can never make a
+    // later manual phone-mic session look auto-started.
+    _phoneMicFallbackActive = false;
     // Flush remaining phone mic WAL buffer before stopping
     if (_phoneMicWalActive) {
       final flushed = _activeSource?.flush() ?? [];
@@ -1131,6 +1141,70 @@ class CaptureProvider extends ChangeNotifier
     ServiceManager.instance().mic.stop();
     updateRecordingState(RecordingState.stop);
     await _socket?.stop(reason: 'stop stream recording');
+  }
+
+  /// Auto-start phone-mic capture when the paired omi device is unavailable and
+  /// native auto-reconnect has had its grace window. Called by DeviceProvider via
+  /// the existing captureProvider reference. Guarded so it never fights a device
+  /// session, a user pause, onboarding, or an already-running phone-mic session.
+  ///
+  /// Returns true if it started a fallback session, false if a guard short-circuited.
+  Future<bool> startPhoneMicFallback() async {
+    // Feature flag (defaults true). False => clean no-op == legacy behavior.
+    if (!SharedPreferencesUtil().autoPhoneMicFallback) {
+      return false;
+    }
+    // Never start during onboarding / speech-profile setup. The speech-profile
+    // flow runs its own socket/BLE stream and must not be interrupted.
+    if (!SharedPreferencesUtil().onboardingCompleted) {
+      Logger.debug('[PhoneMicFallback] skip: onboarding not completed');
+      return false;
+    }
+    // Respect an explicit user pause — don't auto-resume what the user stopped.
+    if (_isPaused) {
+      Logger.debug('[PhoneMicFallback] skip: user paused');
+      return false;
+    }
+    // Single-_activeSource invariant: never run device + phone mic together.
+    // If a BLE device source is active (or any source already exists), bail.
+    if (_activeSource != null) {
+      Logger.debug('[PhoneMicFallback] skip: active source already present (${_activeSource.runtimeType})');
+      return false;
+    }
+    // Don't double-start a phone-mic session.
+    if (_phoneMicFallbackActive) {
+      Logger.debug('[PhoneMicFallback] skip: fallback already active');
+      return false;
+    }
+
+    Logger.debug('[PhoneMicFallback] device unavailable + reconnect exhausted -> starting phone-mic capture');
+    _phoneMicFallbackActive = true;
+    try {
+      await streamRecording();
+    } catch (e, st) {
+      _phoneMicFallbackActive = false;
+      Logger.error('[PhoneMicFallback] startPhoneMicFallback failed: $e\n$st');
+      return false;
+    }
+    return true;
+  }
+
+  /// Hand capture back to the device: tear down an AUTO-STARTED phone-mic
+  /// fallback session so the caller (DeviceProvider) can resume device capture.
+  /// No-op for user-initiated phone-mic sessions (so we never steal a manual
+  /// "Record with Phone" session) and when no phone-mic source is active.
+  Future<void> stopPhoneMicFallback() async {
+    if (!_phoneMicFallbackActive) return;
+    // Guard the single-_activeSource invariant: only tear down if a phone-mic
+    // source is what's actually running. Avoid stopStreamRecording stomping a
+    // device session that may already have taken over.
+    if (_activeSource is! PhoneMicSource) {
+      _phoneMicFallbackActive = false;
+      return;
+    }
+    Logger.debug('[PhoneMicFallback] device reconnected -> stopping phone-mic capture, handing back to device');
+    _phoneMicFallbackActive = false;
+    await stopStreamRecording();
   }
 
   Future streamDeviceRecording({BtDevice? device}) async {
