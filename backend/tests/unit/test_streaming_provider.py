@@ -44,6 +44,11 @@ from utils.stt.realtime_provider import (
 )
 import utils.stt.realtime_provider as realtime_provider_module
 
+# The hallucination detector now lives in the shared utils.stt.hallucination
+# module (realtime_provider re-exports the symbols above for compat). The
+# residue phrase set cache lives there, so monkeypatches target this module.
+import utils.stt.hallucination as hallucination_module
+
 
 # ---------------------------------------------------------------------------
 # ABC contract tests
@@ -1032,7 +1037,7 @@ async def test_hallucination_filter_drops_thank_you(monkeypatch):
         captured.append(segments)
 
     # Ensure default filter is active.
-    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    monkeypatch.setattr(hallucination_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
 
     session = make_session(stream_transcript)
     session._wall_clock_open = 0.0
@@ -1057,7 +1062,7 @@ async def test_hallucination_filter_drops_subscribe(monkeypatch):
     def stream_transcript(segments):
         captured.append(segments)
 
-    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    monkeypatch.setattr(hallucination_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
 
     session = make_session(stream_transcript)
     session._wall_clock_open = 0.0
@@ -1082,7 +1087,7 @@ async def test_hallucination_filter_case_insensitive(monkeypatch):
     def stream_transcript(segments):
         captured.append(segments)
 
-    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    monkeypatch.setattr(hallucination_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
 
     session = make_session(stream_transcript)
     session._wall_clock_open = 0.0
@@ -1109,7 +1114,7 @@ async def test_hallucination_filter_keeps_real_speech(monkeypatch):
     def stream_transcript(segments):
         captured.append(segments)
 
-    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    monkeypatch.setattr(hallucination_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
 
     session = make_session(stream_transcript)
     session._wall_clock_open = 0.0
@@ -1144,7 +1149,7 @@ async def test_hallucination_filter_env_override(monkeypatch):
 
     monkeypatch.setenv('REALTIME_HALLUCINATION_PHRASES', 'Foo bar.,Baz!')
     # Rebuild filter set under the env override.
-    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    monkeypatch.setattr(hallucination_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
 
     session = make_session(stream_transcript)
     session._wall_clock_open = 0.0
@@ -1181,7 +1186,7 @@ async def test_hallucination_filter_disabled_via_empty_env(monkeypatch):
         captured.append(segments)
 
     monkeypatch.setenv('REALTIME_HALLUCINATION_PHRASES', '')
-    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    monkeypatch.setattr(hallucination_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
 
     session = make_session(stream_transcript)
     session._wall_clock_open = 0.0
@@ -1208,7 +1213,7 @@ async def test_session_counter_increments_on_filter_hit(monkeypatch):
     def stream_transcript(segments):
         captured.append(segments)
 
-    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    monkeypatch.setattr(hallucination_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
 
     session = make_session(stream_transcript)
     session._wall_clock_open = 0.0
@@ -1243,7 +1248,7 @@ def test_normalize_phrase_strips_punctuation_and_case():
 
 def test_is_whisper_hallucination_exact_match_only(monkeypatch):
     """Substring matches must NOT trigger. Only normalized exact match."""
-    monkeypatch.setattr(realtime_provider_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
+    monkeypatch.setattr(hallucination_module, '_HALLUCINATION_PHRASES', _load_hallucination_phrases())
     assert _is_whisper_hallucination('Thank you.') is True
     assert _is_whisper_hallucination('thank YOU') is True
     # Substring containing the residue must not match.
