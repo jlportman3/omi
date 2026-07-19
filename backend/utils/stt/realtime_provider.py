@@ -61,12 +61,18 @@ import base64
 import json
 import logging
 import os
-import string
 import time
 from typing import Any, Optional
 
 import websockets
 
+from utils.stt.hallucination import (
+    DEFAULT_HALLUCINATION_PHRASES,
+    _load_hallucination_phrases,
+    _normalize_phrase,
+    is_whisper_hallucination,
+    _is_whisper_hallucination,
+)
 from utils.stt.streaming_provider import (
     StreamTranscriptFn,
     StreamingSegment,
@@ -92,109 +98,19 @@ EXPECTED_FINAL_LATENCY_SEC = 12.0
 
 
 # ---------------------------------------------------------------------------
-# Whisper hallucination filter — known-residue phrases.
+# Whisper hallucination filter.
 #
-# Whisper's training corpus contains lots of YouTube-style sign-offs ("Thank
-# you for watching.", "Don't forget to subscribe.", "[Music]") and short
-# polite filler ("Thank you.", "Bye!"). When the model is fed silence,
-# breathing, or mic noise it confabulates these. The DevKit recording for
-# conv 3deec0e8-87cf-48de-8ece-e6ab0a85f112 had several confirmed cases
-# (e.g. idx 3 'Thank you.', idx 16 'Thanks for watching!', idx 47
-# 'Thank you for watching. Thank you for watching.') — Joe confirmed only
-# the "Thank you." was a real hallucination; the other collapsed-timestamp
-# segments were REAL speech. So the filter is exact-phrase only, never
-# substring (avoids dropping real speech that happens to contain residue).
-#
-# Env override: REALTIME_HALLUCINATION_PHRASES, comma-separated. Empty
-# string explicitly disables the filter.
+# The detector now lives in the shared ``utils.stt.hallucination`` module so
+# the SAME logic filters both this realtime provider (NEW streaming
+# transcripts) and the memory-extraction input filter in
+# ``utils/conversations/process_conversation.py``. It covers three corpus-
+# verified categories: (A) YouTube-residue phrases (env-overridable via
+# ``REALTIME_HALLUCINATION_PHRASES``), (B) repetition loops, and (C) a
+# specific recurring phantom phrase. ``_normalize_phrase``,
+# ``DEFAULT_HALLUCINATION_PHRASES``, ``_load_hallucination_phrases``, and
+# ``_is_whisper_hallucination`` are re-exported above for backward
+# compatibility with existing imports/tests.
 # ---------------------------------------------------------------------------
-
-DEFAULT_HALLUCINATION_PHRASES = [
-    'Thank you.',
-    'Thanks.',
-    'Thank you for watching.',
-    'Thanks for watching.',
-    "Don't forget to subscribe.",
-    'Subscribe.',
-    'Bye.',
-    'Bye!',
-    'Bye bye.',
-    'Bye bye!',
-    'Goodbye.',
-    '[Music]',
-    'Music plays.',
-    'Music.',
-    '♪',
-    '...',
-    'You.',
-]
-
-# Punctuation set used by _normalize_phrase to strip leading/trailing
-# residue. ``string.punctuation`` covers ASCII punctuation; we add em/en
-# dash and ellipsis explicitly since the unicode variants are common in
-# Whisper output.
-_PHRASE_STRIP_CHARS = string.punctuation + '—–…' + ' \t\n\r'
-
-
-def _normalize_phrase(s: str) -> str:
-    """Normalize a phrase for hallucination comparison.
-
-    Applied identically to both the configured phrase set (at load time)
-    and to incoming transcript text (at filter time) so comparison is
-    symmetric.
-
-    Pipeline:
-      1. ``.strip()`` outer whitespace.
-      2. ``.lower()`` — case-insensitive match.
-      3. Strip leading + trailing punctuation (ASCII punct + em/en dash +
-         ellipsis + whitespace).
-      4. Collapse internal whitespace runs to a single space.
-
-    Examples:
-      ``"Thank you."`` -> ``"thank you"``
-      ``" THANK   YOU! "`` -> ``"thank you"``
-      ``"[Music]"`` -> ``"music"`` (brackets are punctuation)
-      ``"♪"`` -> ``"♪"`` (not stripped by string.punctuation)
-    """
-    s = s.strip().lower()
-    s = s.strip(_PHRASE_STRIP_CHARS)
-    return ' '.join(s.split())
-
-
-def _load_hallucination_phrases() -> set:
-    """Build the active hallucination phrase set from env + defaults.
-
-    ``REALTIME_HALLUCINATION_PHRASES`` unset/None -> defaults.
-    ``REALTIME_HALLUCINATION_PHRASES=""`` (explicit empty) -> filter disabled.
-    Otherwise comma-separated list replaces the defaults.
-    """
-    raw = os.getenv('REALTIME_HALLUCINATION_PHRASES')
-    if raw is None:
-        items = DEFAULT_HALLUCINATION_PHRASES
-    elif raw.strip() == '':
-        return set()
-    else:
-        items = raw.split(',')
-    return {_normalize_phrase(p) for p in items if p.strip()}
-
-
-# Module-level cache; tests can rebuild via _load_hallucination_phrases().
-_HALLUCINATION_PHRASES = _load_hallucination_phrases()
-
-
-def _is_whisper_hallucination(text: str) -> bool:
-    """True if ``text`` (after normalization) matches a known residue phrase.
-
-    Exact normalized-string match only — substring matching would drop
-    real speech that contains a residue phrase as part of a longer
-    utterance.
-    """
-    if not _HALLUCINATION_PHRASES:
-        return False
-    normalized = _normalize_phrase(text)
-    if not normalized:
-        return False
-    return normalized in _HALLUCINATION_PHRASES
 
 
 def _get_ws_url() -> str:
@@ -662,20 +578,22 @@ class RealtimeStreamingSession(StreamingTranscriptSession):
         50% of segments) we apply a layered fallback so we never emit a
         collapsed ``start==end`` stamp.
 
-        Also drops known-residue Whisper hallucinations BEFORE invoking
-        ``stream_transcript`` — see ``_HALLUCINATION_PHRASES``.
+        Also drops Whisper hallucinations BEFORE invoking
+        ``stream_transcript`` — all three categories from the shared
+        ``utils.stt.hallucination`` detector: YouTube-residue phrases,
+        repetition loops, and the recurring phantom phrase.
         """
         text = (event.get('transcript') or '').strip()
         if not text:
             return
 
-        # Drop known Whisper YouTube-residue hallucinations before any
-        # downstream call. Still reset the per-utterance window so the
-        # next real item starts clean.
-        if _is_whisper_hallucination(text):
+        # Drop Whisper hallucinations (residue phrases, repetition loops, and
+        # the recurring phantom phrase) before any downstream call. Still reset
+        # the per-utterance window so the next real item starts clean.
+        if is_whisper_hallucination(text):
             self._hallucinations_filtered += 1
             logger.debug(
-                'Realtime: dropping known-residue hallucination text=%r (normalized=%r)',
+                'Realtime: dropping Whisper hallucination text=%r (normalized=%r)',
                 text,
                 _normalize_phrase(text),
             )
@@ -872,4 +790,5 @@ __all__ = [
     '_normalize_phrase',
     '_load_hallucination_phrases',
     '_is_whisper_hallucination',
+    'is_whisper_hallucination',
 ]
