@@ -63,6 +63,7 @@ from utils.llm.conversation_processing import (
 from utils.analytics import record_usage
 from utils.llm.usage_tracker import track_usage, Features
 from utils.llm.memories import extract_memories_from_text, new_memories_extractor
+from utils.stt.hallucination import is_whisper_hallucination
 from utils.llm.external_integrations import summarize_experience_text
 from utils.llm.trends import trends_extractor
 from utils.llm.goals import extract_and_update_goal_progress
@@ -469,10 +470,19 @@ def _extract_memories_inner(uid: str, conversation: Conversation):
         # segments display correctly but must not produce phantom memories.
         # Backward-compat: segments with attribution=None (legacy / pre-Layer-2)
         # fall back to the old is_user-only filter.
+        #
+        # Layer 3 guardrail: also exclude Whisper hallucinations (YouTube
+        # residue, repetition loops, and the recurring phantom phrase) even
+        # when is_user=True — see utils/stt/hallucination.py. Hallucinated
+        # segments were a direct contributor to phantom memories; re-extracting
+        # any conversation now auto-excludes them. Real short backchannel
+        # ("Yeah.", "Okay.", "I know.") is NOT flagged and still passes.
         eligible_segments = [
             seg
             for seg in conversation.transcript_segments
-            if seg.is_user and (seg.attribution is None or seg.attribution.get('extractor_eligible', False))
+            if seg.is_user
+            and (seg.attribution is None or seg.attribution.get('extractor_eligible', False))
+            and not is_whisper_hallucination(seg.text)
         ]
         new_memories = new_memories_extractor(uid, eligible_segments, language=language)
 
