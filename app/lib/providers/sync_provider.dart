@@ -151,12 +151,27 @@ class SyncProvider extends ChangeNotifier implements IWalServiceListener, IWalSy
   }
 
   bool _isAutoUploading = false;
+  // Backoff for the phone->cloud upload loop, mirroring _drainNoProgressStreak
+  // for the device->phone drain. No progress -> back off; any progress resets.
+  int _autoUploadNoProgressStreak = 0;
 
-  /// Auto-upload phone WALs to cloud on app open when device is not connected
-  /// and no sync is already in progress.
-  void _scheduleAutoUploadPendingPhoneFiles() {
+  int get _pendingPhoneWalCount => _allWals
+      .where((w) => w.status == WalStatus.miss && (w.storage == WalStorage.disk || w.storage == WalStorage.mem))
+      .length;
+
+  /// Keep retrying the phone -> cloud upload while phone-side files remain
+  /// pending. This used to be a one-shot timer armed only at provider init,
+  /// which stranded every WAL that an upload attempt failed to drain: the
+  /// drain loop (_scheduleDrainContinuation) bails when the *device* holds
+  /// nothing, and the per-conversation auto-sync in CaptureProvider only
+  /// covers WALs inside the session window it was handed. So a batch that
+  /// errored — e.g. one that hit the 6-minute poll timeout in
+  /// syncLocalFilesV2 — sat as "pending" until the app was restarted, while
+  /// live capture kept adding more.
+  void _scheduleAutoUploadPendingPhoneFiles({Duration delay = const Duration(seconds: 3)}) {
     _autoUploadTimer?.cancel();
-    _autoUploadTimer = Timer(const Duration(seconds: 3), () {
+    if (_isDisposed) return;
+    _autoUploadTimer = Timer(delay, () {
       _autoUploadTimer = null;
       _autoUploadPendingPhoneFiles();
     });
@@ -164,19 +179,46 @@ class SyncProvider extends ChangeNotifier implements IWalServiceListener, IWalSy
 
   void _autoUploadPendingPhoneFiles() async {
     if (_isDisposed) return;
-    if (_syncState.isProcessing) return;
-    if (_walService.getSyncs().isStorageSyncing || _walService.getSyncs().isSdCardSyncing) return;
-    final phoneWals = _allWals
-        .where((w) => w.status == WalStatus.miss && (w.storage == WalStorage.disk || w.storage == WalStorage.mem))
-        .toList();
-    if (phoneWals.isEmpty) return;
-    Logger.debug('SyncProvider: Auto-uploading ${phoneWals.length} pending phone files to cloud');
+    // Something else owns the upload path or the BLE link right now. Check
+    // back shortly instead of returning for good — returning is what left
+    // pending files stranded until the next app launch.
+    if (_syncState.isProcessing || _walService.getSyncs().isStorageSyncing || _walService.getSyncs().isSdCardSyncing) {
+      _scheduleAutoUploadPendingPhoneFiles(delay: const Duration(minutes: 1));
+      return;
+    }
+    final pendingBefore = _pendingPhoneWalCount;
+    // Nothing to do. onWalUpdated re-arms the loop when new WALs appear, so
+    // this is a clean exit rather than a dropped loop.
+    if (pendingBefore == 0) {
+      _autoUploadNoProgressStreak = 0;
+      return;
+    }
+    Logger.debug('SyncProvider: Auto-uploading $pendingBefore pending phone files to cloud');
     _isAutoUploading = true;
     await _performSync(
       operation: () => _walService.getSyncs().phone.syncAll(progress: this),
       context: 'auto-upload phone files',
     );
     _isAutoUploading = false;
+    if (_isDisposed) return;
+
+    final pendingAfter = _pendingPhoneWalCount;
+    if (pendingAfter == 0) {
+      _autoUploadNoProgressStreak = 0;
+      return;
+    }
+    if (pendingAfter < pendingBefore) {
+      _autoUploadNoProgressStreak = 0;
+    } else {
+      _autoUploadNoProgressStreak++;
+    }
+    // 1m, 2m, 4m, ... capped at 30m once uploads stop making headway, so a
+    // persistently unuploadable file doesn't hammer the backend.
+    final minutes = (1 << _autoUploadNoProgressStreak.clamp(0, 5)).clamp(1, 30);
+    Logger.debug(
+      'SyncProvider: $pendingAfter phone file(s) still pending — next upload attempt in ${minutes}m (no-progress streak $_autoUploadNoProgressStreak)',
+    );
+    _scheduleAutoUploadPendingPhoneFiles(delay: Duration(minutes: minutes));
   }
 
   /// Cancel auto-upload if running. Called before device-triggered sync.
@@ -416,6 +458,16 @@ class SyncProvider extends ChangeNotifier implements IWalServiceListener, IWalSy
   @override
   void onWalUpdated() async {
     await refreshWals();
+    // Re-arm the phone -> cloud upload loop if it went quiet. It exits cleanly
+    // when nothing is pending, so a WAL appearing afterwards would otherwise
+    // never get a retry. Only when no attempt is already scheduled or in
+    // flight — this must never shorten an in-progress backoff. The delay is
+    // deliberately long: CaptureProvider's per-conversation auto-sync is the
+    // primary path for freshly captured WALs, and this is the safety net for
+    // whatever it leaves behind.
+    if (!_isDisposed && _autoUploadTimer == null && !_isAutoUploading && _pendingPhoneWalCount > 0) {
+      _scheduleAutoUploadPendingPhoneFiles(delay: const Duration(minutes: 5));
+    }
   }
 
   @override
