@@ -74,6 +74,58 @@ WS_RECEIVE_TIMEOUT = 300.0  # seconds
 # blocking cleanup indefinitely.
 BG_DRAIN_TIMEOUT = 30.0  # seconds
 
+# How long to wait for a connection's Firestore-backed settings before giving up
+# and using the fail-closed defaults below.
+CONNECTION_SETTINGS_TIMEOUT = 15.0  # seconds
+
+# Used when the settings reads time out or error. Fail CLOSED: without the user's
+# real preferences we do not hand their audio to webhooks or apps, and we do not
+# write it to private cloud storage. A connection that streams transcripts but
+# skips those side effects is a far better outcome than one that never starts.
+CONNECTION_SETTINGS_FALLBACK = {
+    'audio_bytes_webhook_delay_seconds': None,
+    'has_audio_apps_enabled': False,
+    'private_cloud_sync_enabled': False,
+    'cached_protection_level': None,
+}
+
+
+def _read_connection_settings(uid: str) -> Dict:
+    """Read one connection's settings. Blocking Firestore reads — executor only."""
+    private_cloud_sync_enabled = users_db.get_user_private_cloud_sync_enabled(uid)
+    return {
+        'audio_bytes_webhook_delay_seconds': get_audio_bytes_webhook_seconds(uid),
+        'has_audio_apps_enabled': is_audio_bytes_app_enabled(uid),
+        'private_cloud_sync_enabled': private_cloud_sync_enabled,
+        'cached_protection_level': users_db.get_data_protection_level(uid) if private_cloud_sync_enabled else None,
+    }
+
+
+async def _load_connection_settings(uid: str) -> Dict:
+    """Load connection settings without ever blocking the event loop.
+
+    These are synchronous Firestore reads, and the Firestore client retries a
+    failed connect for up to 300s before raising. Called inline, that stalls the
+    whole pusher: it stops answering every other connection and every health
+    check, backend-listen's websocket never completes its handshake, and the
+    conversations it was waiting to hand over sit in 'processing' indefinitely.
+    Observed in prod when the host advertised an IPv6 default route with no
+    global IPv6 address, so the gRPC channel hung on every AAAA it resolved.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(storage_executor, _read_connection_settings, uid),
+            timeout=CONNECTION_SETTINGS_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            f'Connection settings timed out after {CONNECTION_SETTINGS_TIMEOUT}s, '
+            f'continuing with fail-closed defaults {uid}'
+        )
+    except Exception as e:
+        logger.error(f'Connection settings read failed ({e}), continuing with fail-closed defaults {uid}')
+    return dict(CONNECTION_SETTINGS_FALLBACK)
+
 
 async def _process_conversation_task(
     uid: str,
@@ -170,11 +222,12 @@ async def _websocket_util_trigger(
     websocket_close_code = 1000
 
     # audio bytes
-    audio_bytes_webhook_delay_seconds = get_audio_bytes_webhook_seconds(uid)
+    settings = await _load_connection_settings(uid)
+    audio_bytes_webhook_delay_seconds = settings['audio_bytes_webhook_delay_seconds']
     audio_bytes_trigger_delay_seconds = 4
-    has_audio_apps_enabled = is_audio_bytes_app_enabled(uid)
-    private_cloud_sync_enabled = users_db.get_user_private_cloud_sync_enabled(uid)
-    cached_protection_level = users_db.get_data_protection_level(uid) if private_cloud_sync_enabled else None
+    has_audio_apps_enabled = settings['has_audio_apps_enabled']
+    private_cloud_sync_enabled = settings['private_cloud_sync_enabled']
+    cached_protection_level = settings['cached_protection_level']
 
     # Track background tasks to cancel on cleanup (prevents memory leaks from fire-and-forget tasks)
     bg_tasks: Set[asyncio.Task] = set()
