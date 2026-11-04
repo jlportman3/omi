@@ -57,7 +57,7 @@ def get_screen_activity_tool(
 
     **When NOT to use:**
     - Questions about conversations or what they said (use get_conversations_tool)
-    - Questions about memories/facts (use get_memories_tool)
+    - Questions about memories/facts (use search_memories_tool)
     - Specific content search like "when was I looking at spreadsheets" (use search_screen_activity_tool)
 
     Args:
