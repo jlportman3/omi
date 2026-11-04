@@ -8,7 +8,9 @@ Tests the logic pattern used in pusher._websocket_util_trigger without importing
 the full pusher module (which has heavy WebSocket/DB dependencies).
 """
 
-from unittest.mock import MagicMock
+import asyncio
+import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -93,3 +95,89 @@ class TestPusherDataProtectionCache:
 
         # get_data_protection_level should only have been called once at session start
         mock_users_db.get_data_protection_level.assert_called_once()
+
+
+class TestLoadConnectionSettings:
+    """Settings load must never block the event loop, and must fail closed.
+
+    A Firestore stall used to wedge the entire pusher: the synchronous reads at
+    the top of _websocket_util_trigger retry for up to 300s, which stops the
+    process answering any connection or health check and leaves conversations
+    stranded in 'processing'.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_real_settings_when_reads_succeed(self):
+        import routers.pusher as pusher
+
+        expected = {
+            'audio_bytes_webhook_delay_seconds': 5,
+            'has_audio_apps_enabled': True,
+            'private_cloud_sync_enabled': True,
+            'cached_protection_level': 'enhanced',
+        }
+        with patch.object(pusher, '_read_connection_settings', return_value=expected):
+            assert await pusher._load_connection_settings('test-uid') == expected
+
+    @pytest.mark.asyncio
+    async def test_slow_reads_fall_back_instead_of_hanging(self):
+        """A read that outlives the timeout must not hold up the connection."""
+        import routers.pusher as pusher
+
+        def _hang(uid):
+            time.sleep(30)  # stands in for the Firestore retry deadline
+            return {'private_cloud_sync_enabled': True}
+
+        started = time.monotonic()
+        with patch.object(pusher, '_read_connection_settings', side_effect=_hang):
+            with patch.object(pusher, 'CONNECTION_SETTINGS_TIMEOUT', 0.2):
+                settings = await pusher._load_connection_settings('test-uid')
+        elapsed = time.monotonic() - started
+
+        assert settings == pusher.CONNECTION_SETTINGS_FALLBACK
+        assert elapsed < 5, f'load blocked for {elapsed:.1f}s instead of timing out'
+
+    @pytest.mark.asyncio
+    async def test_event_loop_stays_responsive_while_reads_hang(self):
+        """The loop must keep running other work during a stalled read."""
+        import routers.pusher as pusher
+
+        def _hang(uid):
+            time.sleep(30)
+            return {}
+
+        ticks = 0
+
+        async def _tick():
+            nonlocal ticks
+            for _ in range(5):
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        with patch.object(pusher, '_read_connection_settings', side_effect=_hang):
+            with patch.object(pusher, 'CONNECTION_SETTINGS_TIMEOUT', 0.3):
+                _, settings = await asyncio.gather(_tick(), pusher._load_connection_settings('test-uid'))
+
+        assert ticks == 5, 'event loop was blocked by the settings read'
+        assert settings == pusher.CONNECTION_SETTINGS_FALLBACK
+
+    @pytest.mark.asyncio
+    async def test_read_error_falls_back_closed(self):
+        import routers.pusher as pusher
+
+        with patch.object(pusher, '_read_connection_settings', side_effect=RuntimeError('firestore down')):
+            settings = await pusher._load_connection_settings('test-uid')
+
+        assert settings == pusher.CONNECTION_SETTINGS_FALLBACK
+        assert settings['private_cloud_sync_enabled'] is False
+        assert settings['has_audio_apps_enabled'] is False
+
+    def test_fallback_does_not_leak_audio(self):
+        """Every side effect that would hand audio elsewhere is off by default."""
+        import routers.pusher as pusher
+
+        fallback = pusher.CONNECTION_SETTINGS_FALLBACK
+        assert fallback['private_cloud_sync_enabled'] is False
+        assert fallback['has_audio_apps_enabled'] is False
+        assert fallback['audio_bytes_webhook_delay_seconds'] is None
+        assert fallback['cached_protection_level'] is None

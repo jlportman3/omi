@@ -63,6 +63,69 @@ TRANSCRIPT_QUEUE_WARN_SIZE = 50
 # Constants for audio bytes queue
 AUDIO_BYTES_QUEUE_WARN_SIZE = 20
 
+# Receive timeout: if no data arrives for this long, the connection is considered dead.
+# Backend-listen sends heartbeats every ~30s, so 5 minutes without ANY data means the
+# upstream connection is gone.  Without this, half-open TCP connections hang forever,
+# leaking the gauge + ~15 MB per ghost connection.
+WS_RECEIVE_TIMEOUT = 300.0  # seconds
+
+# After receive_task exits, background tasks get this long to drain their queues
+# before being force-cancelled.  Prevents hung GCS uploads or webhook calls from
+# blocking cleanup indefinitely.
+BG_DRAIN_TIMEOUT = 30.0  # seconds
+
+# How long to wait for a connection's Firestore-backed settings before giving up
+# and using the fail-closed defaults below.
+CONNECTION_SETTINGS_TIMEOUT = 15.0  # seconds
+
+# Used when the settings reads time out or error. Fail CLOSED: without the user's
+# real preferences we do not hand their audio to webhooks or apps, and we do not
+# write it to private cloud storage. A connection that streams transcripts but
+# skips those side effects is a far better outcome than one that never starts.
+CONNECTION_SETTINGS_FALLBACK = {
+    'audio_bytes_webhook_delay_seconds': None,
+    'has_audio_apps_enabled': False,
+    'private_cloud_sync_enabled': False,
+    'cached_protection_level': None,
+}
+
+
+def _read_connection_settings(uid: str) -> Dict:
+    """Read one connection's settings. Blocking Firestore reads — executor only."""
+    private_cloud_sync_enabled = users_db.get_user_private_cloud_sync_enabled(uid)
+    return {
+        'audio_bytes_webhook_delay_seconds': get_audio_bytes_webhook_seconds(uid),
+        'has_audio_apps_enabled': is_audio_bytes_app_enabled(uid),
+        'private_cloud_sync_enabled': private_cloud_sync_enabled,
+        'cached_protection_level': users_db.get_data_protection_level(uid) if private_cloud_sync_enabled else None,
+    }
+
+
+async def _load_connection_settings(uid: str) -> Dict:
+    """Load connection settings without ever blocking the event loop.
+
+    These are synchronous Firestore reads, and the Firestore client retries a
+    failed connect for up to 300s before raising. Called inline, that stalls the
+    whole pusher: it stops answering every other connection and every health
+    check, backend-listen's websocket never completes its handshake, and the
+    conversations it was waiting to hand over sit in 'processing' indefinitely.
+    Observed in prod when the host advertised an IPv6 default route with no
+    global IPv6 address, so the gRPC channel hung on every AAAA it resolved.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(storage_executor, _read_connection_settings, uid),
+            timeout=CONNECTION_SETTINGS_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            f'Connection settings timed out after {CONNECTION_SETTINGS_TIMEOUT}s, '
+            f'continuing with fail-closed defaults {uid}'
+        )
+    except Exception as e:
+        logger.error(f'Connection settings read failed ({e}), continuing with fail-closed defaults {uid}')
+    return dict(CONNECTION_SETTINGS_FALLBACK)
+
 
 async def _process_conversation_task(
     uid: str,
@@ -159,11 +222,12 @@ async def _websocket_util_trigger(
     websocket_close_code = 1000
 
     # audio bytes
-    audio_bytes_webhook_delay_seconds = get_audio_bytes_webhook_seconds(uid)
+    settings = await _load_connection_settings(uid)
+    audio_bytes_webhook_delay_seconds = settings['audio_bytes_webhook_delay_seconds']
     audio_bytes_trigger_delay_seconds = 4
-    has_audio_apps_enabled = is_audio_bytes_app_enabled(uid)
-    private_cloud_sync_enabled = users_db.get_user_private_cloud_sync_enabled(uid)
-    cached_protection_level = users_db.get_data_protection_level(uid) if private_cloud_sync_enabled else None
+    has_audio_apps_enabled = settings['has_audio_apps_enabled']
+    private_cloud_sync_enabled = settings['private_cloud_sync_enabled']
+    cached_protection_level = settings['cached_protection_level']
 
     # Track background tasks to cancel on cleanup (prevents memory leaks from fire-and-forget tasks)
     bg_tasks: Set[asyncio.Task] = set()
@@ -403,7 +467,12 @@ async def _websocket_util_trigger(
 
         try:
             while websocket_active:
-                data = await websocket.receive_bytes()
+                try:
+                    data = await asyncio.wait_for(websocket.receive_bytes(), timeout=WS_RECEIVE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning(f"WebSocket receive timeout ({WS_RECEIVE_TIMEOUT}s), closing connection {uid}")
+                    websocket_close_code = 1000
+                    break
                 header_type = struct.unpack('<I', data[:4])[0]
 
                 # Heartbeat (data-frame keepalive from backend to reset GKE ILB idle timer)
@@ -585,32 +654,47 @@ async def _websocket_util_trigger(
                 logger.info(f"Flushed final private cloud buffer: {len(private_cloud_sync_buffer)} bytes {uid}")
             websocket_active = False
 
+    bg_main_tasks = []
     try:
         PUSHER_ACTIVE_WS_CONNECTIONS.inc()
         receive_task = asyncio.create_task(receive_tasks())
-        speaker_sample_task = asyncio.create_task(process_speaker_sample_queue())
-        private_cloud_task = asyncio.create_task(process_private_cloud_queue())
-        transcript_task = asyncio.create_task(process_transcript_queue())
-        audio_bytes_task = asyncio.create_task(process_audio_bytes_queue())
-        await asyncio.gather(
-            receive_task,
-            speaker_sample_task,
-            private_cloud_task,
-            transcript_task,
-            audio_bytes_task,
-        )
+        bg_main_tasks = [
+            asyncio.create_task(process_speaker_sample_queue()),
+            asyncio.create_task(process_private_cloud_queue()),
+            asyncio.create_task(process_transcript_queue()),
+            asyncio.create_task(process_audio_bytes_queue()),
+        ]
+
+        # Wait for receive_task — it exits on disconnect, error, or receive timeout.
+        # Previous code used asyncio.gather() for ALL 5 tasks, which meant a hung
+        # background task (e.g. stuck GCS upload) would block cleanup forever,
+        # leaking ~15 MB per ghost connection and inflating the gauge.
+        await receive_task
+
+        # receive_tasks() already set websocket_active = False.
+        # Give background tasks a grace period to drain their queues.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*bg_main_tasks, return_exceptions=True),
+                timeout=BG_DRAIN_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Background tasks didn't drain within {BG_DRAIN_TIMEOUT}s, force-cancelling {uid}")
+            for task in bg_main_tasks:
+                task.cancel()
+            await asyncio.gather(*bg_main_tasks, return_exceptions=True)
 
     except Exception as e:
         logger.error(f"Error during WebSocket operation: {e}")
     finally:
         websocket_active = False
 
-        # Cancel all tracked background tasks to prevent memory leaks
-        tasks_to_cancel = list(bg_tasks)
-        for task in tasks_to_cancel:
+        # Cancel background tasks from both spawn() and main task lists
+        all_to_cancel = list(bg_tasks) + [t for t in bg_main_tasks if not t.done()]
+        for task in all_to_cancel:
             task.cancel()
-        if tasks_to_cancel:
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        if all_to_cancel:
+            await asyncio.gather(*all_to_cancel, return_exceptions=True)
         bg_tasks.clear()
 
         PUSHER_ACTIVE_WS_CONNECTIONS.dec()
