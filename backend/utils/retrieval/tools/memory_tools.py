@@ -46,35 +46,35 @@ def get_memories_tool(
     - "What are my hobbies?" → USE THIS TOOL (facts about user)
     - "What happened at the party?" → DO NOT USE THIS - use search_conversations_tool (event)
 
+    **PREFER search_memories_tool INSTEAD** whenever the question names a topic. That tool
+    ranks memories by semantic relevance and returns the handful that actually answer the
+    question. This tool returns an unranked slice of a very large memory set, so for a
+    specific question the answer is usually buried and effectively unanswerable.
+
     Use this tool ONLY when:
-    - User asks "what do you know about me?" or "tell me about my preferences"
-    - You need background context about the user's preferences to personalize responses
-    - User asks about their interests, goals, habits, or relationships (static facts)
-    - Questions like "do I like X?", "what's my favorite Y?", "what are my Z?"
+    - User asks an open-ended "what do you know about me?" / "tell me about myself"
+    - You need broad background context to personalize a response
 
     DO NOT use this tool when:
+    - The question is about a specific topic (use search_memories_tool instead)
+    - Questions like "do I like X?", "what's my favorite Y?", "what do you know about my Z?"
     - User asks about specific events/incidents (use search_conversations_tool instead)
     - Questions like "when did X happen?", "what happened at Y?", "when did I get Z?"
 
     Memory retrieval guidance - choosing the right limit:
-    - **CRITICAL**: For ANY question asking about basic personal information (name, age, location, background, etc.) or multiple personal facts together, you MUST use limit=5000 to get ALL memories
-    - **For GENERAL COMPREHENSIVE questions, you MUST use limit=5000** to get ALL memories
-    - **For specific questions about a single narrow topic, you can use limit=50-200**
-    - Examples when you MUST use limit=5000:
+    - A full fetch can be tens of thousands of tokens and take minutes, and it drowns the
+      answer in unrelated facts. Only do it when the request is genuinely open-ended.
+    - **For open-ended profile requests, use limit=5000** to get ALL memories:
       * "what do you know about me"
       * "tell me about myself"
-      * "what's my name, age, and location"
       * "who am I"
-      * "what's my profile"
-      * "what's my age"
-      * "where do I live"
       * "tell me everything"
-      * "what are all my interests"
-      * Any question asking for multiple personal facts together
-    - Examples when limit=50-200 is acceptable:
-      * "what conversations did I have about Python"
-      * "what do I know about machine learning"
-      * Questions about a specific narrow topic
+    - **For anything naming a topic or a single attribute, do NOT use this tool at all** -
+      use search_memories_tool, which is both faster and more accurate:
+      * "what's my age", "where do I live" -> search_memories_tool("age"), ("location")
+      * "what do I know about machine learning" -> search_memories_tool
+      * "what's my favorite food" -> search_memories_tool
+    - If search_memories_tool returns nothing useful, you may then fall back to this tool
     - **Ask user for confirmation** before fetching 500+ memories for very broad analysis, as it may take longer
     - **Maximum limit is 5000 per call** - use pagination (offset parameter) if more are needed
 

@@ -148,7 +148,9 @@ def retrieve_is_an_omi_question(question: str) -> bool:
     {question}
     
     Is this asking about the Omi/Friend app product itself?
-    '''.replace('    ', '').strip()
+    '''.replace(
+        '    ', ''
+    ).strip()
     with_parser = get_llm('chat_extraction').with_structured_output(IsAnOmiQuestion)
     response: IsAnOmiQuestion = with_parser.invoke(prompt)
     try:
@@ -199,7 +201,9 @@ def retrieve_context_dates_by_question(question: str, tz: str) -> List[datetime]
     {question}
     </question>
 
-    '''.replace('    ', '').strip()
+    '''.replace(
+        '    ', ''
+    ).strip()
 
     # print(prompt)
     # print(get_llm('chat_extraction').invoke(prompt).content)
@@ -256,7 +260,9 @@ def _get_answer_simple_message_prompt(uid: str, messages: List[Message], app: Op
     {conversation_history}
 
     Answer:
-    """.replace('    ', '').strip()
+    """.replace(
+        '    ', ''
+    ).strip()
 
 
 def answer_simple_message(uid: str, messages: List[Message], plugin: Optional[App] = None) -> str:
@@ -287,7 +293,9 @@ def _get_answer_omi_question_prompt(messages: List[Message], context: str) -> st
     {conversation_history}
 
     Answer:
-    """.replace('    ', '').strip()
+    """.replace(
+        '    ', ''
+    ).strip()
 
 
 def answer_omi_question(messages: List[Message], context: str) -> str:
@@ -326,7 +334,8 @@ def _get_qa_rag_prompt(
       - Avoid citing irrelevant memories.
     """
 
-    return f"""
+    return (
+        f"""
     <assistant_role>
         You are an assistant for question-answering tasks.
     </assistant_role>
@@ -385,7 +394,12 @@ def _get_qa_rag_prompt(
     </question_timezone>
 
     <answer>
-    """.replace('    ', '').replace('\n\n\n', '\n\n').strip()
+    """.replace(
+            '    ', ''
+        )
+        .replace('\n\n\n', '\n\n')
+        .strip()
+    )
 
 
 def _get_agentic_qa_prompt(
@@ -654,11 +668,14 @@ To maximize context and find the most relevant conversations, follow these strat
      * Finding conversations about specific people, places, or things
      * Any question asking "when did X happen?" or "what happened when Y?"
    - Use **get_conversations_tool** for: Time-based queries without specific search criteria, general activities, chronological views
-   - Use **get_memories_tool** for: ONLY static facts/preferences about the user (name, age, preferences, habits, goals, relationships) - NOT for specific events or incidents
+   - Use **search_memories_tool** for: static facts/preferences about the user when the question names a topic. This is the DEFAULT for memory questions - it ranks by semantic relevance, so it finds the few facts that actually answer the question.
+   - Use **get_memories_tool** for: ONLY open-ended "tell me everything about me" requests. It returns an unranked slice of thousands of memories, so it buries the answer to any specific question - NOT for specific events or incidents
    - **IMPORTANT DISTINCTION**:
-     * "What's my favorite food?" → get_memories_tool (preference/fact)
+     * "What's my favorite food?" → search_memories_tool (targeted preference)
+     * "What do you know about my motorcycle?" → search_memories_tool (targeted fact)
+     * "Do I like dogs?" → search_memories_tool (targeted preference)
+     * "Tell me everything you know about me" → get_memories_tool (open-ended)
      * "When did I get food poisoning?" → search_conversations_tool (EVENT)
-     * "Do I like dogs?" → get_memories_tool (preference)
      * "When did a dog bite me?" → search_conversations_tool (EVENT)
    - Always prefer narrower time windows first (hours > day > week > month) for better relevance
 </conversation_retrieval_strategies>
@@ -725,7 +742,7 @@ When the user asks about specific dates/times, they are ALWAYS referring to date
 - Never say robotic phrases like "based on available memories", "according to the tools", "in the logs", "in your captured calls", "in your recorded conversations" - instead say things like "from what I remember", "last time you mentioned this", etc.
 - **CRITICAL**: Follow <critical_accuracy_rules> - if you don't have info, give a SHORT 1-2 line response and stop. No long explanations, no offers to reconstruct, no follow-up questions.
 - If a tool returns "No conversations/memories found," say honestly that {user_name} doesn’t have that data yet, in a friendly way.
-- Use get_memories_tool for questions about {user_name}'s static facts/preferences (name, age, habits, goals, relationships). Do NOT use it for questions about specific events/incidents - use search_conversations_tool instead for those.
+- Use search_memories_tool for questions about {user_name}'s static facts/preferences on a specific topic (the usual case); reserve get_memories_tool for open-ended "everything about me" requests. Do NOT use either for questions about specific events/incidents - use search_conversations_tool instead for those.
 - Use correct date/time format (see <tool_datetime_rules>) when calling tools.
 - Cite conversations when using them (see <citing_instructions>).
 - Show times/dates in {user_name}'s timezone ({tz}), in a natural, friendly way (e.g., "3:45 PM, Tuesday, Oct 16th").
@@ -738,7 +755,7 @@ When the user asks about specific dates/times, they are ALWAYS referring to date
 </instructions>
 
 {plugin_section}
-Remember: Use tools strategically to provide the best possible answers. For questions about specific EVENTS or INCIDENTS (e.g., "when did X happen?", "what happened at Y?"), use search_conversations_tool to find relevant conversations. For questions about static FACTS/PREFERENCES (e.g., "what's my favorite X?", "do I like Y?"), use get_memories_tool. Your goal is to help {user_name} in the most personalized and helpful way possible.
+Remember: Use tools strategically to provide the best possible answers. For questions about specific EVENTS or INCIDENTS (e.g., "when did X happen?", "what happened at Y?"), use search_conversations_tool to find relevant conversations. For targeted questions about static FACTS/PREFERENCES (e.g., "what's my favorite X?", "do I like Y?"), use search_memories_tool; reserve get_memories_tool for open-ended "everything about me" requests. Your goal is to help {user_name} in the most personalized and helpful way possible.
 """
 
     return base_prompt.strip()
@@ -788,7 +805,7 @@ NO essays summarizing their message. NO headers. Just talk like you're texting a
 <tool_instructions>
 DateTime Formatting: Use ISO format with timezone (YYYY-MM-DDTHH:MM:SS+HH:MM).
 All datetime calculations in {user_name}'s timezone ({tz}), current time: {current_datetime_iso}
-Use search_conversations_tool for events, get_memories_tool for static facts/preferences.
+Use search_conversations_tool for events, search_memories_tool for targeted facts/preferences, and get_memories_tool only for open-ended "everything about me" requests.
 When user asks to "show a graph", "chart", or "visualize" data: first fetch data with the appropriate tool, then call create_chart_tool with the data points.
 </tool_instructions>
 
@@ -871,7 +888,9 @@ def retrieve_memory_context_params(
 
     Conversation:
     {transcript}
-    '''.replace('    ', '').strip()
+    '''.replace(
+        '    ', ''
+    ).strip()
 
     try:
         with_parser = get_llm('chat_extraction').with_structured_output(TopicsContext)
@@ -916,7 +935,9 @@ def obtain_emotional_message(
     ```
     {context}
     ```
-    """.replace('    ', '').strip()
+    """.replace(
+        '    ', ''
+    ).strip()
     with track_usage(uid, Features.CHAT):
         return get_llm('chat_extraction').invoke(prompt).content
 
@@ -1032,7 +1053,9 @@ def extract_question_from_conversation(messages: List[Message]) -> str:
     - this day
     - etc.
     </date_in_term>
-    '''.replace('    ', '').strip()
+    '''.replace(
+        '    ', ''
+    ).strip()
     # print(prompt)
     question = get_llm('chat_extraction').with_structured_output(OutputQuestion).invoke(prompt).question
     # print(question)
@@ -1079,7 +1102,9 @@ def retrieve_metadata_fields_from_transcript(
     ```
     {full_context}
     ```
-    '''.replace('    ', '')
+    '''.replace(
+        '    ', ''
+    )
     try:
         with track_usage(uid, Features.CONVERSATION_PROCESSING):
             result: ExtractedInformation = (
@@ -1165,7 +1190,9 @@ def retrieve_metadata_from_message(
     ```
     {message_text}
     ```
-    '''.replace('    ', '')
+    '''.replace(
+        '    ', ''
+    )
 
     return _process_extracted_metadata(uid, prompt)
 
@@ -1199,7 +1226,9 @@ def retrieve_metadata_from_text(
     ```
     {text}
     ```
-    '''.replace('    ', '')
+    '''.replace(
+        '    ', ''
+    )
 
     return _process_extracted_metadata(uid, prompt)
 
@@ -1274,7 +1303,9 @@ def select_structured_filters(question: str, filters_available: dict) -> dict:
     ```
 
     Question: {question}
-    '''.replace('    ', '').strip()
+    '''.replace(
+        '    ', ''
+    ).strip()
     # print(prompt)
     with_parser = get_llm('chat_extraction').with_structured_output(FiltersToUse)
     try:
@@ -1322,7 +1353,9 @@ def extract_question_from_transcript(uid: str, segments: List[TranscriptSegment]
     ```
     {TranscriptSegment.segments_as_string(segments, people=people, user_name=user_name)}
     ```
-    '''.replace('    ', '').strip()
+    '''.replace(
+        '    ', ''
+    ).strip()
     with track_usage(uid, Features.REALTIME_INTEGRATIONS):
         return get_llm('chat_extraction').with_structured_output(OutputQuestion).invoke(prompt).question
 
@@ -1372,6 +1405,8 @@ def provide_advice_message(uid: str, segments: List[TranscriptSegment], context:
     ```
     {context}
     ```
-    """.replace('    ', '').strip()
+    """.replace(
+        '    ', ''
+    ).strip()
     with track_usage(uid, Features.REALTIME_INTEGRATIONS):
         return get_llm('chat_extraction').with_structured_output(OutputMessage).invoke(prompt).message

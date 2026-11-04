@@ -302,7 +302,7 @@ def search_conversations_tool(
     - Understanding overall themes or patterns in conversations
 
     **When NOT to use this tool:**
-    - For user preferences/facts (use get_memories_tool for "what's my favorite X?", "do I like Y?")
+    - For user preferences/facts (use search_memories_tool for "what's my favorite X?", "do I like Y?")
 
     **Tip:** For best results, use descriptive phrases about the event or concept you're looking for.
 
